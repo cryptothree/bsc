@@ -21,7 +21,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"sync/atomic"
 	"time"
 
@@ -66,7 +65,7 @@ func (msg Msg) String() string {
 
 // Discard reads any remaining payload data into a black hole.
 func (msg Msg) Discard() error {
-	_, err := io.Copy(ioutil.Discard, msg.Payload)
+	_, err := io.Copy(io.Discard, msg.Payload)
 	return err
 }
 
@@ -153,13 +152,21 @@ func (r *eofSignal) Read(buf []byte) (int, error) {
 // MsgPipe creates a message pipe. Reads on one end are matched
 // with writes on the other. The pipe is full-duplex, both ends
 // implement MsgReadWriter.
-func MsgPipe() (*MsgPipeRW, *MsgPipeRW) {
+func MsgPipe(args ...any) (*MsgPipeRW, *MsgPipeRW) {
+	noBlock := false
+	if len(args) > 0 {
+		noBlock = args[0].(bool)
+	}
+	c1, c2 := make(chan Msg), make(chan Msg)
+	if noBlock {
+		c1 = make(chan Msg, 1)
+		c2 = make(chan Msg, 1)
+	}
 	var (
-		c1, c2  = make(chan Msg), make(chan Msg)
 		closing = make(chan struct{})
-		closed  = new(int32)
-		rw1     = &MsgPipeRW{c1, c2, closing, closed}
-		rw2     = &MsgPipeRW{c2, c1, closing, closed}
+		closed  = new(atomic.Bool)
+		rw1     = &MsgPipeRW{c1, c2, closing, closed, noBlock}
+		rw2     = &MsgPipeRW{c2, c1, closing, closed, noBlock}
 	)
 	return rw1, rw2
 }
@@ -173,17 +180,21 @@ type MsgPipeRW struct {
 	w       chan<- Msg
 	r       <-chan Msg
 	closing chan struct{}
-	closed  *int32
+	closed  *atomic.Bool
+	noBlock bool
 }
 
 // WriteMsg sends a message on the pipe.
 // It blocks until the receiver has consumed the message payload.
 func (p *MsgPipeRW) WriteMsg(msg Msg) error {
-	if atomic.LoadInt32(p.closed) == 0 {
+	if !p.closed.Load() {
 		consumed := make(chan struct{}, 1)
 		msg.Payload = &eofSignal{msg.Payload, msg.Size, consumed}
 		select {
 		case p.w <- msg:
+			if p.noBlock {
+				return nil
+			}
 			if msg.Size > 0 {
 				// wait for payload read or discard
 				select {
@@ -200,7 +211,7 @@ func (p *MsgPipeRW) WriteMsg(msg Msg) error {
 
 // ReadMsg returns a message sent on the other end of the pipe.
 func (p *MsgPipeRW) ReadMsg() (Msg, error) {
-	if atomic.LoadInt32(p.closed) == 0 {
+	if !p.closed.Load() {
 		select {
 		case msg := <-p.r:
 			return msg, nil
@@ -214,9 +225,8 @@ func (p *MsgPipeRW) ReadMsg() (Msg, error) {
 // of the pipe. They will return ErrPipeClosed. Close also
 // interrupts any reads from a message payload.
 func (p *MsgPipeRW) Close() error {
-	if atomic.AddInt32(p.closed, 1) != 1 {
+	if p.closed.Swap(true) {
 		// someone else is already closing
-		atomic.StoreInt32(p.closed, 1) // avoid overflow
 		return nil
 	}
 	close(p.closing)
@@ -244,7 +254,7 @@ func ExpectMsg(r MsgReader, code uint64, content interface{}) error {
 	if int(msg.Size) != len(contentEnc) {
 		return fmt.Errorf("message size mismatch: got %d, want %d", msg.Size, len(contentEnc))
 	}
-	actualContent, err := ioutil.ReadAll(msg.Payload)
+	actualContent, err := io.ReadAll(msg.Payload)
 	if err != nil {
 		return err
 	}

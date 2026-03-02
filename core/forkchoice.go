@@ -19,11 +19,11 @@ package core
 import (
 	crand "crypto/rand"
 	"errors"
+	"math"
 	"math/big"
 	mrand "math/rand"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
@@ -31,8 +31,7 @@ import (
 )
 
 // ChainReader defines a small collection of methods needed to access the local
-// blockchain during header verification. It's implemented by both blockchain
-// and lightchain.
+// blockchain during header verification. It's implemented by blockchain.
 type ChainReader interface {
 	// Config retrieves the header chain's chain configuration.
 	Config() *params.ChainConfig
@@ -55,39 +54,39 @@ type ChainReader interface {
 type ForkChoice struct {
 	chain ChainReader
 	rand  *mrand.Rand
-
-	// preserve is a helper function used in td fork choice.
-	// Miners will prefer to choose the local mined block if the
-	// local td is equal to the extern one. It can be nil for light
-	// client
-	preserve func(header *types.Header) bool
 }
 
-func NewForkChoice(chainReader ChainReader, preserve func(header *types.Header) bool) *ForkChoice {
+func NewForkChoice(chainReader ChainReader) *ForkChoice {
 	// Seed a fast but crypto originating random generator
 	seed, err := crand.Int(crand.Reader, big.NewInt(math.MaxInt64))
 	if err != nil {
 		log.Crit("Failed to initialize random seed", "err", err)
 	}
 	return &ForkChoice{
-		chain:    chainReader,
-		rand:     mrand.New(mrand.NewSource(seed.Int64())),
-		preserve: preserve,
+		chain: chainReader,
+		rand:  mrand.New(mrand.NewSource(seed.Int64())),
 	}
 }
 
-// reorgNeeded returns whether the reorg should be applied
+// ReorgNeeded returns whether the reorg should be applied
 // based on the given external header and local canonical chain.
 // In the td mode, the new head is chosen if the corresponding
 // total difficulty is higher. In the extern mode, the trusted
 // header is always selected as the head.
-func (f *ForkChoice) reorgNeeded(current *types.Header, header *types.Header) (bool, error) {
+func (f *ForkChoice) ReorgNeeded(current *types.Header, extern *types.Header) (bool, error) {
 	var (
 		localTD  = f.chain.GetTd(current.Hash(), current.Number.Uint64())
-		externTd = f.chain.GetTd(header.Hash(), header.Number.Uint64())
+		externTd = f.chain.GetTd(extern.Hash(), extern.Number.Uint64())
 	)
-	if localTD == nil || externTd == nil {
+	if localTD == nil {
 		return false, errors.New("missing td")
+	}
+	if externTd == nil {
+		ptd := f.chain.GetTd(extern.ParentHash, extern.Number.Uint64()-1)
+		if ptd == nil {
+			return false, consensus.ErrUnknownAncestor
+		}
+		externTd = new(big.Int).Add(ptd, extern.Difficulty)
 	}
 	// Accept the new header as the chain head if the transition
 	// is already triggered. We assume all the headers after the
@@ -95,21 +94,33 @@ func (f *ForkChoice) reorgNeeded(current *types.Header, header *types.Header) (b
 	if ttd := f.chain.Config().TerminalTotalDifficulty; ttd != nil && ttd.Cmp(externTd) <= 0 {
 		return true, nil
 	}
+
 	// If the total difficulty is higher than our known, add it to the canonical chain
+	if diff := externTd.Cmp(localTD); diff > 0 {
+		return true, nil
+	} else if diff < 0 {
+		return false, nil
+	}
+	// Local and external difficulty is identical.
 	// Second clause in the if statement reduces the vulnerability to selfish mining.
 	// Please refer to http://www.cs.cornell.edu/~ie53/publications/btcProcFC.pdf
-	reorg := externTd.Cmp(localTD) > 0
-	if !reorg && externTd.Cmp(localTD) == 0 {
-		number, headNumber := header.Number.Uint64(), current.Number.Uint64()
-		if number < headNumber {
-			reorg = true
-		} else if number == headNumber {
-			var currentPreserve, externPreserve bool
-			if f.preserve != nil {
-				currentPreserve, externPreserve = f.preserve(current), f.preserve(header)
+	reorg := false
+	externNum, localNum := extern.Number.Uint64(), current.Number.Uint64()
+	if externNum < localNum {
+		reorg = true
+	} else if externNum == localNum {
+		reorg = func() bool {
+			if extern.Time == current.Time {
+				doubleSign := (extern.Coinbase == current.Coinbase)
+				if doubleSign {
+					return extern.Hash().Cmp(current.Hash()) < 0
+				} else {
+					return f.rand.Float64() < 0.5
+				}
+			} else {
+				return extern.Time < current.Time
 			}
-			reorg = !currentPreserve && (externPreserve || f.rand.Float64() < 0.5)
-		}
+		}()
 	}
 	return reorg, nil
 }
@@ -118,7 +129,7 @@ func (f *ForkChoice) reorgNeeded(current *types.Header, header *types.Header) (b
 func (f *ForkChoice) ReorgNeededWithFastFinality(current *types.Header, header *types.Header) (bool, error) {
 	_, ok := f.chain.Engine().(consensus.PoSA)
 	if !ok {
-		return f.reorgNeeded(current, header)
+		return f.ReorgNeeded(current, header)
 	}
 
 	justifiedNumber, curJustifiedNumber := uint64(0), uint64(0)
@@ -129,8 +140,12 @@ func (f *ForkChoice) ReorgNeededWithFastFinality(current *types.Header, header *
 		curJustifiedNumber = f.chain.GetJustifiedNumber(current)
 	}
 	if justifiedNumber == curJustifiedNumber {
-		return f.reorgNeeded(current, header)
+		return f.ReorgNeeded(current, header)
 	}
 
+	if justifiedNumber > curJustifiedNumber && header.Number.Cmp(current.Number) <= 0 {
+		log.Info("Chain find higher justifiedNumber", "fromHeight", current.Number, "fromHash", current.Hash(), "fromMiner", current.Coinbase, "fromJustified", curJustifiedNumber,
+			"toHeight", header.Number, "toHash", header.Hash(), "toMiner", header.Coinbase, "toJustified", justifiedNumber)
+	}
 	return justifiedNumber > curJustifiedNumber, nil
 }

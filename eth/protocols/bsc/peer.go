@@ -1,8 +1,11 @@
 package bsc
 
 import (
-	mapset "github.com/deckarep/golang-set"
+	"time"
 
+	"errors"
+
+	mapset "github.com/deckarep/golang-set/v2"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
@@ -13,21 +16,28 @@ const (
 	// maxKnownVotes is the maximum vote hashes to keep in the known list
 	// before starting to randomly evict them.
 	maxKnownVotes = 5376
-)
 
-// max is a helper function which returns the larger of the two given integers.
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
+	// voteBufferSize is the maximum number of batch votes can be hold before sending
+	voteBufferSize = 21 * 2
+
+	// used to avoid of DDOS attack
+	// It's the max number of received votes per second from one peer
+	// 21 validators exist now, so 21 votes will be produced every one block interval
+	// so the limit is 47 ~= 21/0.45, here set it to 68 with a buffer.
+	receiveRateLimitPerSecond = 68
+
+	// the time span of one period
+	secondsPerPeriod = float64(30)
+)
 
 // Peer is a collection of relevant information we have about a `bsc` peer.
 type Peer struct {
 	id            string                     // Unique ID for the peer, cached
 	knownVotes    *knownCache                // Set of vote hashes known to be known by this peer
 	voteBroadcast chan []*types.VoteEnvelope // Channel used to queue votes propagation requests
+	periodBegin   time.Time                  // Begin time of the latest period for votes counting
+	periodCounter uint                       // Votes number in the latest period
+	dispatcher    *Dispatcher                // Message request-response dispatcher
 
 	*p2p.Peer                   // The embedded P2P package peer
 	rw        p2p.MsgReadWriter // Input/output streams for bsc
@@ -43,13 +53,16 @@ func NewPeer(version uint, p *p2p.Peer, rw p2p.MsgReadWriter) *Peer {
 	peer := &Peer{
 		id:            id,
 		knownVotes:    newKnownCache(maxKnownVotes),
-		voteBroadcast: make(chan []*types.VoteEnvelope),
+		voteBroadcast: make(chan []*types.VoteEnvelope, voteBufferSize),
+		periodBegin:   time.Now(),
+		periodCounter: 0,
 		Peer:          p,
 		rw:            rw,
 		version:       version,
 		logger:        log.New("peer", id[:8]),
 		term:          make(chan struct{}),
 	}
+	peer.dispatcher = NewDispatcher(peer)
 	go peer.broadcastVotes()
 	return peer
 }
@@ -105,8 +118,25 @@ func (p *Peer) AsyncSendVotes(votes []*types.VoteEnvelope) {
 	select {
 	case p.voteBroadcast <- votes:
 	case <-p.term:
-		p.Log().Debug("Dropping vote propagation", "count", len(votes))
+		p.Log().Debug("Dropping vote propagation for closed peer", "count", len(votes))
+	default:
+		p.Log().Debug("Dropping vote propagation for abnormal peer", "count", len(votes))
 	}
+}
+
+// Step into the next period when secondsPerPeriod seconds passed,
+// Otherwise, check whether the number of received votes extra (secondsPerPeriod * receiveRateLimitPerSecond)
+func (p *Peer) IsOverLimitAfterReceiving() bool {
+	if timeInterval := time.Since(p.periodBegin).Seconds(); timeInterval >= secondsPerPeriod {
+		if p.periodCounter > uint(secondsPerPeriod*receiveRateLimitPerSecond) {
+			p.Log().Debug("sending votes too much", "secondsPerPeriod", secondsPerPeriod, "count ", p.periodCounter)
+		}
+		p.periodBegin = time.Now()
+		p.periodCounter = 0
+		return false
+	}
+	p.periodCounter += 1
+	return p.periodCounter > uint(secondsPerPeriod*receiveRateLimitPerSecond)
 }
 
 // broadcastVotes is a write loop that schedules votes broadcasts
@@ -129,7 +159,7 @@ func (p *Peer) broadcastVotes() {
 
 // knownCache is a cache for known hashes.
 type knownCache struct {
-	hashes mapset.Set
+	hashes mapset.Set[common.Hash]
 	max    int
 }
 
@@ -137,7 +167,7 @@ type knownCache struct {
 func newKnownCache(max int) *knownCache {
 	return &knownCache{
 		max:    max,
-		hashes: mapset.NewSet(),
+		hashes: mapset.NewSet[common.Hash](),
 	}
 }
 
@@ -154,4 +184,33 @@ func (k *knownCache) add(hashes ...common.Hash) {
 // contains returns whether the given item is in the set.
 func (k *knownCache) contains(hash common.Hash) bool {
 	return k.hashes.Contains(hash)
+}
+
+// RequestBlocksByRange send GetBlocksByRangeMsg by request start block hash
+func (p *Peer) RequestBlocksByRange(startHeight uint64, startHash common.Hash, count uint64) ([]*BlockData, error) {
+	requestID := p.dispatcher.GenRequestID()
+	res, err := p.dispatcher.DispatchRequest(&Request{
+		code:      GetBlocksByRangeMsg,
+		want:      BlocksByRangeMsg,
+		requestID: requestID,
+		data: &GetBlocksByRangePacket{
+			RequestId:        requestID,
+			StartBlockHeight: startHeight,
+			StartBlockHash:   startHash,
+			Count:            count,
+		},
+		timeout: 400 * time.Millisecond,
+	})
+	log.Debug("RequestBlocksByRange result", "requestID", requestID, "ret", res == nil, "err", err)
+	if err != nil {
+		return nil, err
+	}
+
+	// Type assertion to get response object
+	ret, ok := res.(*BlocksByRangePacket)
+	if !ok {
+		return nil, errors.New("unexpected response type")
+	}
+
+	return ret.Blocks, nil
 }

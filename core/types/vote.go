@@ -1,10 +1,12 @@
 package types
 
 import (
+	"bytes"
+	"math/big"
 	"sync/atomic"
 
 	"github.com/pkg/errors"
-	"github.com/prysmaticlabs/prysm/v4/crypto/bls"
+	"github.com/prysmaticlabs/prysm/v5/crypto/bls"
 
 	"github.com/ethereum/go-ethereum/common"
 )
@@ -14,7 +16,6 @@ const (
 	BLSSignatureLength = 96
 
 	MaxAttestationExtraLength = 256
-	NaturallyFinalizedDist    = 21 // The distance to naturally finalized a block
 )
 
 type BLSPublicKey [BLSPublicKeyLength]byte
@@ -73,20 +74,58 @@ func (v *VoteEnvelope) calcVoteHash() common.Hash {
 func (b BLSPublicKey) Bytes() []byte { return b[:] }
 
 // Verify vote using BLS.
-func (vote *VoteEnvelope) Verify() error {
-	blsPubKey, err := bls.PublicKeyFromBytes(vote.VoteAddress[:])
+func (v *VoteEnvelope) Verify() error {
+	blsPubKey, err := bls.PublicKeyFromBytes(v.VoteAddress[:])
 	if err != nil {
 		return errors.Wrap(err, "convert public key from bytes to bls failed")
 	}
 
-	sig, err := bls.SignatureFromBytes(vote.Signature[:])
+	sig, err := bls.SignatureFromBytes(v.Signature[:])
 	if err != nil {
 		return errors.Wrap(err, "invalid signature")
 	}
 
-	voteDataHash := vote.Data.Hash()
+	voteDataHash := v.Data.Hash()
 	if !sig.Verify(blsPubKey, voteDataHash[:]) {
 		return errors.New("verify bls signature failed.")
 	}
 	return nil
+}
+
+type SlashIndicatorVoteDataWrapper struct {
+	SrcNum  *big.Int
+	SrcHash string
+	TarNum  *big.Int
+	TarHash string
+	Sig     string
+}
+
+type SlashIndicatorFinalityEvidenceWrapper struct {
+	VoteA    SlashIndicatorVoteDataWrapper
+	VoteB    SlashIndicatorVoteDataWrapper
+	VoteAddr string
+}
+
+func NewSlashIndicatorFinalityEvidenceWrapper(vote1, vote2 *VoteEnvelope) *SlashIndicatorFinalityEvidenceWrapper {
+	if !bytes.Equal(vote1.VoteAddress[:], vote1.VoteAddress[:]) ||
+		vote1.Data == nil || vote2.Data == nil {
+		return nil
+	}
+	return &SlashIndicatorFinalityEvidenceWrapper{
+		VoteA: SlashIndicatorVoteDataWrapper{
+			SrcNum:  big.NewInt(int64(vote1.Data.SourceNumber)),
+			SrcHash: common.Bytes2Hex(vote1.Data.SourceHash[:]),
+			TarNum:  big.NewInt(int64(vote1.Data.TargetNumber)),
+			TarHash: common.Bytes2Hex(vote1.Data.TargetHash[:]),
+			Sig:     common.Bytes2Hex(vote1.Signature[:]),
+		},
+		VoteB: SlashIndicatorVoteDataWrapper{
+			SrcNum:  big.NewInt(int64(vote2.Data.SourceNumber)),
+			SrcHash: common.Bytes2Hex(vote2.Data.SourceHash[:]),
+			TarNum:  big.NewInt(int64(vote2.Data.TargetNumber)),
+			TarHash: common.Bytes2Hex(vote2.Data.TargetHash[:]),
+			Sig:     common.Bytes2Hex(vote2.Signature[:]),
+		},
+		VoteAddr: common.Bytes2Hex(vote1.VoteAddress[:]),
+	}
 }

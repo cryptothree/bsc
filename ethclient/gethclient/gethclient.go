@@ -19,6 +19,7 @@ package gethclient
 
 import (
 	"context"
+	"fmt"
 	"math/big"
 	"runtime"
 	"runtime/debug"
@@ -27,9 +28,13 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/eth/tracers"
 	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/rpc"
 )
+
+// MaxGetProofKeys is the maximum number of keys allowed in a GetProof request
+const MaxGetProofKeys = 512
 
 // Client is a wrapper around rpc.Client that implements geth-specific functionality.
 //
@@ -79,7 +84,6 @@ type StorageResult struct {
 // GetProof returns the account and storage values of the specified account including the Merkle-proof.
 // The block number can be nil, in which case the value is taken from the latest known block.
 func (ec *Client) GetProof(ctx context.Context, account common.Address, keys []string, blockNumber *big.Int) (*AccountResult, error) {
-
 	type storageResult struct {
 		Key   string       `json:"key"`
 		Value *hexutil.Big `json:"value"`
@@ -94,6 +98,19 @@ func (ec *Client) GetProof(ctx context.Context, account common.Address, keys []s
 		Nonce        hexutil.Uint64  `json:"nonce"`
 		StorageHash  common.Hash     `json:"storageHash"`
 		StorageProof []storageResult `json:"storageProof"`
+	}
+
+	// Avoid keys being 'null'.
+	if keys == nil {
+		keys = []string{}
+	} else {
+		// Remove duplicate keys
+		keys = removeDuplicates(keys)
+	}
+
+	// Reject requests with too many keys
+	if len(keys) > MaxGetProofKeys {
+		return nil, fmt.Errorf("too many keys: %d (maximum %d)", len(keys), MaxGetProofKeys)
 	}
 
 	var res accountResult
@@ -119,15 +136,6 @@ func (ec *Client) GetProof(ctx context.Context, account common.Address, keys []s
 	return &result, err
 }
 
-// OverrideAccount specifies the state of an account to be overridden.
-type OverrideAccount struct {
-	Nonce     uint64                      `json:"nonce"`
-	Code      []byte                      `json:"code"`
-	Balance   *big.Int                    `json:"balance"`
-	State     map[common.Hash]common.Hash `json:"state"`
-	StateDiff map[common.Hash]common.Hash `json:"stateDiff"`
-}
-
 // CallContract executes a message call transaction, which is directly executed in the VM
 // of the node, but never mined into the blockchain.
 //
@@ -142,7 +150,29 @@ func (ec *Client) CallContract(ctx context.Context, msg ethereum.CallMsg, blockN
 	var hex hexutil.Bytes
 	err := ec.c.CallContext(
 		ctx, &hex, "eth_call", toCallArg(msg),
-		toBlockNumArg(blockNumber), toOverrideMap(overrides),
+		toBlockNumArg(blockNumber), overrides,
+	)
+	return hex, err
+}
+
+// CallContractWithBlockOverrides executes a message call transaction, which is directly executed
+// in the VM  of the node, but never mined into the blockchain.
+//
+// blockNumber selects the block height at which the call runs. It can be nil, in which
+// case the code is taken from the latest known block. Note that state from very old
+// blocks might not be available.
+//
+// overrides specifies a map of contract states that should be overwritten before executing
+// the message call.
+//
+// blockOverrides specifies block fields exposed to the EVM that can be overridden for the call.
+//
+// Please use ethclient.CallContract instead if you don't need the override functionality.
+func (ec *Client) CallContractWithBlockOverrides(ctx context.Context, msg ethereum.CallMsg, blockNumber *big.Int, overrides *map[common.Address]OverrideAccount, blockOverrides BlockOverrides) ([]byte, error) {
+	var hex hexutil.Bytes
+	err := ec.c.CallContext(
+		ctx, &hex, "eth_call", toCallArg(msg),
+		toBlockNumArg(blockNumber), overrides, blockOverrides,
 	)
 	return hex, err
 }
@@ -175,28 +205,51 @@ func (ec *Client) GetNodeInfo(ctx context.Context) (*p2p.NodeInfo, error) {
 	return &result, err
 }
 
-// SubscribePendingTransactions subscribes to new pending transactions.
+// SubscribeFullPendingTransactions subscribes to new pending transactions.
+func (ec *Client) SubscribeFullPendingTransactions(ctx context.Context, ch chan<- *types.Transaction) (*rpc.ClientSubscription, error) {
+	return ec.c.EthSubscribe(ctx, ch, "newPendingTransactions", true)
+}
+
+// SubscribePendingTransactions subscribes to new pending transaction hashes.
 func (ec *Client) SubscribePendingTransactions(ctx context.Context, ch chan<- common.Hash) (*rpc.ClientSubscription, error) {
 	return ec.c.EthSubscribe(ctx, ch, "newPendingTransactions")
+}
+
+// TraceTransaction returns the structured logs created during the execution of EVM
+// and returns them as a JSON object.
+func (ec *Client) TraceTransaction(ctx context.Context, hash common.Hash, config *tracers.TraceConfig) (any, error) {
+	var result any
+	err := ec.c.CallContext(ctx, &result, "debug_traceTransaction", hash, config)
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// TraceBlock returns the structured logs created during the execution of EVM
+// and returns them as a JSON object.
+func (ec *Client) TraceBlock(ctx context.Context, hash common.Hash, config *tracers.TraceConfig) (any, error) {
+	var result any
+	err := ec.c.CallContext(ctx, &result, "debug_traceBlockByHash", hash, config)
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 func toBlockNumArg(number *big.Int) string {
 	if number == nil {
 		return "latest"
 	}
-	pending := big.NewInt(-1)
-	if number.Cmp(pending) == 0 {
-		return "pending"
+	if number.Sign() >= 0 {
+		return hexutil.EncodeBig(number)
 	}
-	finalized := big.NewInt(int64(rpc.FinalizedBlockNumber))
-	if number.Cmp(finalized) == 0 {
-		return "finalized"
+	// It's negative.
+	if number.IsInt64() {
+		return rpc.BlockNumber(number.Int64()).String()
 	}
-	safe := big.NewInt(int64(rpc.SafeBlockNumber))
-	if number.Cmp(safe) == 0 {
-		return "safe"
-	}
-	return hexutil.EncodeBig(number)
+	// It's negative and large, which is invalid.
+	return fmt.Sprintf("<invalid %d>", number)
 }
 
 func toCallArg(msg ethereum.CallMsg) interface{} {
@@ -205,7 +258,7 @@ func toCallArg(msg ethereum.CallMsg) interface{} {
 		"to":   msg.To,
 	}
 	if len(msg.Data) > 0 {
-		arg["data"] = hexutil.Bytes(msg.Data)
+		arg["input"] = hexutil.Bytes(msg.Data)
 	}
 	if msg.Value != nil {
 		arg["value"] = (*hexutil.Big)(msg.Value)
@@ -216,29 +269,47 @@ func toCallArg(msg ethereum.CallMsg) interface{} {
 	if msg.GasPrice != nil {
 		arg["gasPrice"] = (*hexutil.Big)(msg.GasPrice)
 	}
+	if msg.GasFeeCap != nil {
+		arg["maxFeePerGas"] = (*hexutil.Big)(msg.GasFeeCap)
+	}
+	if msg.GasTipCap != nil {
+		arg["maxPriorityFeePerGas"] = (*hexutil.Big)(msg.GasTipCap)
+	}
+	if msg.AccessList != nil {
+		arg["accessList"] = msg.AccessList
+	}
+	if msg.BlobGasFeeCap != nil {
+		arg["maxFeePerBlobGas"] = (*hexutil.Big)(msg.BlobGasFeeCap)
+	}
+	if msg.BlobHashes != nil {
+		arg["blobVersionedHashes"] = msg.BlobHashes
+	}
+	if msg.AuthorizationList != nil {
+		arg["authorizationList"] = msg.AuthorizationList
+	}
 	return arg
 }
 
-func toOverrideMap(overrides *map[common.Address]OverrideAccount) interface{} {
-	if overrides == nil {
-		return nil
-	}
-	type overrideAccount struct {
-		Nonce     hexutil.Uint64              `json:"nonce"`
-		Code      hexutil.Bytes               `json:"code"`
-		Balance   *hexutil.Big                `json:"balance"`
-		State     map[common.Hash]common.Hash `json:"state"`
-		StateDiff map[common.Hash]common.Hash `json:"stateDiff"`
-	}
-	result := make(map[common.Address]overrideAccount)
-	for addr, override := range *overrides {
-		result[addr] = overrideAccount{
-			Nonce:     hexutil.Uint64(override.Nonce),
-			Code:      override.Code,
-			Balance:   (*hexutil.Big)(override.Balance),
-			State:     override.State,
-			StateDiff: override.StateDiff,
+// OverrideAccount is an alias for ethereum.OverrideAccount.
+type OverrideAccount = ethereum.OverrideAccount
+
+// BlockOverrides is an alias for ethereum.BlockOverrides.
+type BlockOverrides = ethereum.BlockOverrides
+
+// removeDuplicates removes duplicate values from a string slice while preserving order
+func removeDuplicates(slice []string) []string {
+	seen := make(map[string]struct{})
+	result := make([]string, 0, len(slice))
+
+	for _, item := range slice {
+		// Skip empty strings because they are considered invalid or irrelevant in this context.
+		if item == "" {
+			continue
+		}
+		if _, exists := seen[item]; !exists {
+			seen[item] = struct{}{}
+			result = append(result, item)
 		}
 	}
-	return &result
+	return result
 }

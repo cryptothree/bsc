@@ -156,6 +156,10 @@ func (am *Manager) update() {
 			am.lock.Unlock()
 			close(event.processed)
 		case errc := <-am.quit:
+			// Close all owned wallets
+			for _, w := range am.wallets {
+				w.Close()
+			}
 			// Manager terminating, return
 			errc <- nil
 			// Signals event emitters the loop is not receiving values
@@ -257,7 +261,7 @@ func merge(slice []Wallet, wallets ...Wallet) []Wallet {
 	return slice
 }
 
-// drop is the couterpart of merge, which looks up wallets from within the sorted
+// drop is the counterpart of merge, which looks up wallets from within the sorted
 // cache and removes the ones specified.
 func drop(slice []Wallet, wallets ...Wallet) []Wallet {
 	for _, wallet := range wallets {

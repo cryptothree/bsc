@@ -19,23 +19,28 @@ package state
 import (
 	"math/big"
 	"testing"
-	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
+	"github.com/ethereum/go-ethereum/core/tracing"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/internal/testrand"
+	"github.com/ethereum/go-ethereum/triedb"
+	"github.com/holiman/uint256"
 )
 
 func filledStateDB() *StateDB {
-	state, _ := New(common.Hash{}, NewDatabase(rawdb.NewMemoryDatabase()), nil)
+	state, _ := New(types.EmptyRootHash, NewDatabaseForTesting())
 
 	// Create an account and check if the retrieved balance is correct
 	addr := common.HexToAddress("0xaffeaffeaffeaffeaffeaffeaffeaffeaffeaffe")
 	skey := common.HexToHash("aaa")
 	sval := common.HexToHash("bbb")
 
-	state.SetBalance(addr, big.NewInt(42)) // Change the account trie
-	state.SetCode(addr, []byte("hello"))   // Change an external metadata
-	state.SetState(addr, skey, sval)       // Change the storage trie
+	state.SetBalance(addr, uint256.NewInt(42), tracing.BalanceChangeUnspecified) // Change the account trie
+	state.SetCode(addr, []byte("hello"), tracing.CodeChangeUnspecified)          // Change an external metadata
+	state.SetState(addr, skey, sval)                                             // Change the storage trie
 	for i := 0; i < 100; i++ {
 		sk := common.BigToHash(big.NewInt(int64(i)))
 		state.SetState(addr, sk, sk) // Change the storage trie
@@ -43,78 +48,60 @@ func filledStateDB() *StateDB {
 	return state
 }
 
-func prefetchGuaranteed(prefetcher *triePrefetcher, root common.Hash, keys [][]byte, accountHash common.Hash) {
-	prefetcher.prefetch(root, keys, accountHash)
-	for {
-		if len(prefetcher.prefetchChan) == 0 {
-			return
-		}
-		time.Sleep(1 * time.Millisecond)
+func TestUseAfterTerminate(t *testing.T) {
+	db := filledStateDB()
+	prefetcher := newTriePrefetcher(db.db, db.originalRoot, "", true)
+	skey := common.HexToHash("aaa")
+
+	if err := prefetcher.prefetch(common.Hash{}, db.originalRoot, common.Address{}, nil, []common.Hash{skey}, false); err != nil {
+		t.Errorf("Prefetch failed before terminate: %v", err)
+	}
+	prefetcher.terminate(false)
+
+	if err := prefetcher.prefetch(common.Hash{}, db.originalRoot, common.Address{}, nil, []common.Hash{skey}, false); err == nil {
+		t.Errorf("Prefetch succeeded after terminate: %v", err)
+	}
+	if tr := prefetcher.trie(common.Hash{}, db.originalRoot); tr == nil {
+		t.Errorf("Prefetcher returned nil trie after terminate")
 	}
 }
 
-func TestCopyAndClose(t *testing.T) {
-	db := filledStateDB()
-	prefetcher := newTriePrefetcher(db.db, db.originalRoot, common.Hash{}, "")
-	skey := common.HexToHash("aaa")
-	prefetchGuaranteed(prefetcher, db.originalRoot, [][]byte{skey.Bytes()}, common.Hash{})
-	prefetchGuaranteed(prefetcher, db.originalRoot, [][]byte{skey.Bytes()}, common.Hash{})
-	time.Sleep(1 * time.Second)
-	a := prefetcher.trie(db.originalRoot)
-	prefetchGuaranteed(prefetcher, db.originalRoot, [][]byte{skey.Bytes()}, common.Hash{})
-	b := prefetcher.trie(db.originalRoot)
-	cpy := prefetcher.copy()
-	prefetchGuaranteed(cpy, db.originalRoot, [][]byte{skey.Bytes()}, common.Hash{})
-	prefetchGuaranteed(cpy, db.originalRoot, [][]byte{skey.Bytes()}, common.Hash{})
-	c := cpy.trie(db.originalRoot)
-	prefetcher.close()
-	cpy2 := cpy.copy()
-	prefetchGuaranteed(cpy2, db.originalRoot, [][]byte{skey.Bytes()}, common.Hash{})
-	d := cpy2.trie(db.originalRoot)
-	cpy.close()
-	cpy2.close()
-	if a.Hash() != b.Hash() || a.Hash() != c.Hash() || a.Hash() != d.Hash() {
-		t.Fatalf("Invalid trie, hashes should be equal: %v %v %v %v", a.Hash(), b.Hash(), c.Hash(), d.Hash())
-	}
-}
+func TestVerklePrefetcher(t *testing.T) {
+	disk := rawdb.NewMemoryDatabase()
+	db := triedb.NewDatabase(disk, triedb.VerkleDefaults)
+	sdb := NewDatabase(db, nil)
 
-func TestUseAfterClose(t *testing.T) {
-	db := filledStateDB()
-	prefetcher := newTriePrefetcher(db.db, db.originalRoot, common.Hash{}, "")
-	skey := common.HexToHash("aaa")
-	prefetchGuaranteed(prefetcher, db.originalRoot, [][]byte{skey.Bytes()}, common.Hash{})
-	a := prefetcher.trie(db.originalRoot)
-	prefetcher.close()
-	b := prefetcher.trie(db.originalRoot)
-	if a == nil {
-		t.Fatal("Prefetching before close should not return nil")
+	state, err := New(types.EmptyRootHash, sdb)
+	if err != nil {
+		t.Fatalf("failed to initialize state: %v", err)
 	}
-	if b != nil {
-		t.Fatal("Trie after close should return nil")
-	}
-}
+	// Create an account and check if the retrieved balance is correct
+	addr := testrand.Address()
+	skey := testrand.Hash()
+	sval := testrand.Hash()
 
-func TestCopyClose(t *testing.T) {
-	db := filledStateDB()
-	prefetcher := newTriePrefetcher(db.db, db.originalRoot, common.Hash{}, "")
-	skey := common.HexToHash("aaa")
-	prefetchGuaranteed(prefetcher, db.originalRoot, [][]byte{skey.Bytes()}, common.Hash{})
-	cpy := prefetcher.copy()
-	a := prefetcher.trie(db.originalRoot)
-	b := cpy.trie(db.originalRoot)
-	prefetcher.close()
-	c := prefetcher.trie(db.originalRoot)
-	d := cpy.trie(db.originalRoot)
-	if a == nil {
-		t.Fatal("Prefetching before close should not return nil")
-	}
-	if b == nil {
-		t.Fatal("Copy trie should return nil")
-	}
-	if c != nil {
-		t.Fatal("Trie after close should return nil")
-	}
-	if d == nil {
-		t.Fatal("Copy trie should not return nil")
+	state.SetBalance(addr, uint256.NewInt(42), tracing.BalanceChangeUnspecified) // Change the account trie
+	state.SetCode(addr, []byte("hello"), tracing.CodeChangeUnspecified)          // Change an external metadata
+	state.SetState(addr, skey, sval)                                             // Change the storage trie
+	root, _ := state.Commit(0, true, false)
+
+	state, _ = New(root, sdb)
+	sRoot := state.GetStorageRoot(addr)
+	fetcher := newTriePrefetcher(sdb, root, "", false)
+
+	// Read account
+	fetcher.prefetch(common.Hash{}, root, common.Address{}, []common.Address{addr}, nil, false)
+
+	// Read storage slot
+	fetcher.prefetch(crypto.Keccak256Hash(addr.Bytes()), sRoot, addr, nil, []common.Hash{skey}, false)
+
+	fetcher.terminate(false)
+	accountTrie := fetcher.trie(common.Hash{}, root)
+	storageTrie := fetcher.trie(crypto.Keccak256Hash(addr.Bytes()), sRoot)
+
+	rootA := accountTrie.Hash()
+	rootB := storageTrie.Hash()
+	if rootA != rootB {
+		t.Fatal("Two different tries are retrieved")
 	}
 }

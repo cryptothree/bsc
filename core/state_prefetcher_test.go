@@ -1,32 +1,32 @@
 package core
 
 import (
-	"math/big"
-	"testing"
-	"time"
-
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"math/big"
 	"runtime/pprof"
+	"slices"
 	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus/ethash"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/triedb"
 
 	"github.com/google/pprof/profile"
 )
 
 func TestPrefetchLeaking(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	var (
 		gendb   = rawdb.NewMemoryDatabase()
 		key, _  = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
@@ -37,7 +37,7 @@ func TestPrefetchLeaking(t *testing.T) {
 			Alloc:   GenesisAlloc{address: {Balance: funds}},
 			BaseFee: big.NewInt(params.InitialBaseFee),
 		}
-		genesis = gspec.MustCommit(gendb)
+		genesis = gspec.MustCommit(gendb, triedb.NewDatabase(gendb, nil))
 		signer  = types.LatestSigner(gspec.Config)
 	)
 	blocks, _ := GenerateChain(gspec.Config, genesis, ethash.NewFaker(), gendb, 1, func(i int, block *BlockGen) {
@@ -51,18 +51,18 @@ func TestPrefetchLeaking(t *testing.T) {
 		}
 	})
 	archiveDb := rawdb.NewMemoryDatabase()
-	gspec.MustCommit(archiveDb)
-	archive, _ := NewBlockChain(archiveDb, nil, gspec.Config, ethash.NewFaker(), vm.Config{}, nil, nil)
+	gspec.MustCommit(archiveDb, triedb.NewDatabase(archiveDb, nil))
+	archive, _ := NewBlockChain(archiveDb, gspec, ethash.NewFaker(), nil)
 	defer archive.Stop()
 
 	block := blocks[0]
 	parent := archive.GetHeader(block.ParentHash(), block.NumberU64()-1)
-	statedb, _ := state.NewWithSharedPool(parent.Root, archive.stateCache, archive.snaps)
-	inter := make(chan struct{})
+	statedb, _ := state.New(parent.Root, archive.statedb)
+	var inter atomic.Bool
 
 	Track(ctx, t, func(ctx context.Context) {
-		close(inter)
-		go archive.prefetcher.Prefetch(block, statedb, &archive.vmConfig, inter)
+		defer inter.Store(true)
+		go archive.prefetcher.Prefetch(block.Transactions(), block.Header(), block.GasLimit(), statedb, archive.cfg.VmConfig, &inter)
 		time.Sleep(1 * time.Second)
 	})
 }
@@ -79,7 +79,7 @@ func CheckNoGoroutines(key, value string) error {
 	var pb bytes.Buffer
 	profiler := pprof.Lookup("goroutine")
 	if profiler == nil {
-		return fmt.Errorf("unable to find profile")
+		return errors.New("unable to find profile")
 	}
 	err := profiler.WriteTo(&pb, 0)
 	if err != nil {
@@ -138,11 +138,5 @@ func matchesLabel(sample *profile.Sample, key, expectedValue string) bool {
 		return false
 	}
 
-	for _, value := range values {
-		if value == expectedValue {
-			return true
-		}
-	}
-
-	return false
+	return slices.Contains(values, expectedValue)
 }

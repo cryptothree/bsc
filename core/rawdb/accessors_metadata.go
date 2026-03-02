@@ -18,7 +18,6 @@ package rawdb
 
 import (
 	"encoding/json"
-	"math/big"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -31,7 +30,6 @@ import (
 // FreezerType enumerator
 const (
 	EntireFreezerType uint64 = iota // classic ancient type
-	PruneFreezerType                // prune ancient type
 )
 
 // ReadDatabaseVersion retrieves the version number of the database.
@@ -88,6 +86,20 @@ func WriteChainConfig(db ethdb.KeyValueWriter, hash common.Hash, cfg *params.Cha
 	}
 }
 
+// ReadGenesisStateSpec retrieves the genesis state specification based on the
+// given genesis (block-)hash.
+func ReadGenesisStateSpec(db ethdb.KeyValueReader, blockhash common.Hash) []byte {
+	data, _ := db.Get(genesisStateSpecKey(blockhash))
+	return data
+}
+
+// WriteGenesisStateSpec writes the genesis state specification into the disk.
+func WriteGenesisStateSpec(db ethdb.KeyValueWriter, blockhash common.Hash, data []byte) {
+	if err := db.Put(genesisStateSpecKey(blockhash), data); err != nil {
+		log.Crit("Failed to store genesis state", "err", err)
+	}
+}
+
 // crashList is a list of unclean-shutdown-markers, for rlp-encoding to the
 // database
 type crashList struct {
@@ -104,10 +116,10 @@ const crashesToKeep = 10
 func PushUncleanShutdownMarker(db ethdb.KeyValueStore) ([]uint64, uint64, error) {
 	var uncleanShutdowns crashList
 	// Read old data
-	if data, err := db.Get(uncleanShutdownKey); err != nil {
-		log.Warn("Error reading unclean shutdown markers", "error", err)
-	} else if err := rlp.DecodeBytes(data, &uncleanShutdowns); err != nil {
-		return nil, 0, err
+	if data, err := db.Get(uncleanShutdownKey); err == nil {
+		if err := rlp.DecodeBytes(data, &uncleanShutdowns); err != nil {
+			return nil, 0, err
+		}
 	}
 	var discarded = uncleanShutdowns.Discarded
 	var previous = make([]uint64, len(uncleanShutdowns.Recent))
@@ -165,98 +177,5 @@ func UpdateUncleanShutdownMarker(db ethdb.KeyValueStore) {
 	data, _ := rlp.EncodeToBytes(uncleanShutdowns)
 	if err := db.Put(uncleanShutdownKey, data); err != nil {
 		log.Warn("Failed to write unclean-shutdown marker", "err", err)
-	}
-}
-
-// ReadTransitionStatus retrieves the eth2 transition status from the database
-func ReadTransitionStatus(db ethdb.KeyValueReader) []byte {
-	data, _ := db.Get(transitionStatusKey)
-	return data
-}
-
-// WriteTransitionStatus stores the eth2 transition status to the database
-func WriteTransitionStatus(db ethdb.KeyValueWriter, data []byte) {
-	if err := db.Put(transitionStatusKey, data); err != nil {
-		log.Crit("Failed to store the eth2 transition status", "err", err)
-	}
-}
-
-// ReadOffSetOfCurrentAncientFreezer return prune block start
-func ReadOffSetOfCurrentAncientFreezer(db ethdb.KeyValueReader) uint64 {
-	offset, _ := db.Get(offSetOfCurrentAncientFreezer)
-	if offset == nil {
-		return 0
-	}
-	return new(big.Int).SetBytes(offset).Uint64()
-}
-
-// WriteOffSetOfCurrentAncientFreezer write prune block start
-func WriteOffSetOfCurrentAncientFreezer(db ethdb.KeyValueWriter, offset uint64) {
-	if err := db.Put(offSetOfCurrentAncientFreezer, new(big.Int).SetUint64(offset).Bytes()); err != nil {
-		log.Crit("Failed to store the current offset of ancient", "err", err)
-	}
-}
-
-// ReadOffSetOfLastAncientFreezer return last prune block start
-func ReadOffSetOfLastAncientFreezer(db ethdb.KeyValueReader) uint64 {
-	offset, _ := db.Get(offSetOfLastAncientFreezer)
-	if offset == nil {
-		return 0
-	}
-	return new(big.Int).SetBytes(offset).Uint64()
-}
-
-// WriteOffSetOfLastAncientFreezer wirte before prune block start
-func WriteOffSetOfLastAncientFreezer(db ethdb.KeyValueWriter, offset uint64) {
-	if err := db.Put(offSetOfLastAncientFreezer, new(big.Int).SetUint64(offset).Bytes()); err != nil {
-		log.Crit("Failed to store the old offset of ancient", "err", err)
-	}
-}
-
-// ReadFrozenOfAncientFreezer return freezer block number
-func ReadFrozenOfAncientFreezer(db ethdb.KeyValueReader) uint64 {
-	fozen, _ := db.Get(frozenOfAncientDBKey)
-	if fozen == nil {
-		return 0
-	}
-	return new(big.Int).SetBytes(fozen).Uint64()
-}
-
-// WriteFrozenOfAncientFreezer write freezer block number
-func WriteFrozenOfAncientFreezer(db ethdb.KeyValueWriter, frozen uint64) {
-	if err := db.Put(frozenOfAncientDBKey, new(big.Int).SetUint64(frozen).Bytes()); err != nil {
-		log.Crit("Failed to store the ancient frozen number", "err", err)
-	}
-}
-
-// ReadSafePointBlockNumber return the number of block that roothash save to disk
-func ReadSafePointBlockNumber(db ethdb.KeyValueReader) uint64 {
-	num, _ := db.Get(LastSafePointBlockKey)
-	if num == nil {
-		return 0
-	}
-	return new(big.Int).SetBytes(num).Uint64()
-}
-
-// WriteSafePointBlockNumber write the number of block that roothash save to disk
-func WriteSafePointBlockNumber(db ethdb.KeyValueWriter, number uint64) {
-	if err := db.Put(LastSafePointBlockKey, new(big.Int).SetUint64(number).Bytes()); err != nil {
-		log.Crit("Failed to store safe point of block number", "err", err)
-	}
-}
-
-// ReadAncientType return freezer type
-func ReadAncientType(db ethdb.KeyValueReader) uint64 {
-	data, _ := db.Get(pruneAncientKey)
-	if data == nil {
-		return EntireFreezerType
-	}
-	return new(big.Int).SetBytes(data).Uint64()
-}
-
-// WriteAncientType write freezer type
-func WriteAncientType(db ethdb.KeyValueWriter, flag uint64) {
-	if err := db.Put(pruneAncientKey, new(big.Int).SetUint64(flag).Bytes()); err != nil {
-		log.Crit("Failed to store prune ancient type", "err", err)
 	}
 }

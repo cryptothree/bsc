@@ -1,11 +1,12 @@
 package monitor
 
 import (
-	"github.com/ethereum/go-ethereum/common"
+	"encoding/json"
+
+	"github.com/ethereum/go-ethereum/common/lru"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
-	lru "github.com/hashicorp/golang-lru"
 )
 
 // follow define in core/vote
@@ -24,24 +25,19 @@ var (
 // 1. monitor whether there are bugs in the voting mechanism, so add metrics to observe it.
 // 2. do malicious vote slashing. TODO
 type MaliciousVoteMonitor struct {
-	curVotes map[types.BLSPublicKey]*lru.Cache
+	curVotes map[types.BLSPublicKey]*lru.Cache[uint64, *types.VoteEnvelope]
 }
 
 func NewMaliciousVoteMonitor() *MaliciousVoteMonitor {
 	return &MaliciousVoteMonitor{
-		curVotes: make(map[types.BLSPublicKey]*lru.Cache, 21), // mainnet config
+		curVotes: make(map[types.BLSPublicKey]*lru.Cache[uint64, *types.VoteEnvelope], 21), // mainnet config
 	}
 }
 
 func (m *MaliciousVoteMonitor) ConflictDetect(newVote *types.VoteEnvelope, pendingBlockNumber uint64) bool {
 	// get votes for specified VoteAddress
 	if _, ok := m.curVotes[newVote.VoteAddress]; !ok {
-		voteDataBuffer, err := lru.New(maxSizeOfRecentEntry)
-		if err != nil {
-			log.Error("MaliciousVoteMonitor new lru failed", "err", err)
-			return false
-		}
-		m.curVotes[newVote.VoteAddress] = voteDataBuffer
+		m.curVotes[newVote.VoteAddress] = lru.NewCache[uint64, *types.VoteEnvelope](maxSizeOfRecentEntry)
 	}
 	voteDataBuffer := m.curVotes[newVote.VoteAddress]
 	sourceNumber, targetNumber := newVote.Data.SourceNumber, newVote.Data.TargetNumber
@@ -57,29 +53,40 @@ func (m *MaliciousVoteMonitor) ConflictDetect(newVote *types.VoteEnvelope, pendi
 	if !(blockNumber+maliciousVoteSlashScope > pendingBlockNumber) {
 		blockNumber = pendingBlockNumber - maliciousVoteSlashScope + 1
 	}
+	newVoteHash := newVote.Data.Hash()
 	for ; blockNumber <= pendingBlockNumber+upperLimitOfVoteBlockNumber; blockNumber++ {
 		if voteDataBuffer.Contains(blockNumber) {
-			voteData, ok := voteDataBuffer.Get(blockNumber)
+			voteEnvelope, ok := voteDataBuffer.Get(blockNumber)
 			if !ok {
 				log.Error("Failed to get voteData info from LRU cache.")
 				continue
 			}
-			if blockNumber == targetNumber {
-				log.Warn("violate rule1", "VoteAddress", common.Bytes2Hex(newVote.VoteAddress[:]), "voteExisted", voteData.(*types.VoteData), "newVote", newVote.Data)
+			maliciousVote := false
+			if blockNumber == targetNumber && voteEnvelope.Data.Hash() != newVoteHash {
 				violateRule1Counter.Inc(1)
-				// prepare message for slashing
-				return true
-			} else if (blockNumber < targetNumber && voteData.(*types.VoteData).SourceNumber > sourceNumber) ||
-				(blockNumber > targetNumber && voteData.(*types.VoteData).SourceNumber < sourceNumber) {
-				log.Warn("violate rule2", "VoteAddress", common.Bytes2Hex(newVote.VoteAddress[:]), "voteExisted", voteData.(*types.VoteData), "newVote", newVote.Data)
+				maliciousVote = true
+			} else if (blockNumber < targetNumber && voteEnvelope.Data.SourceNumber > sourceNumber) ||
+				(blockNumber > targetNumber && voteEnvelope.Data.SourceNumber < sourceNumber) {
 				violateRule2Counter.Inc(1)
-				// prepare message for slashing
+				maliciousVote = true
+			}
+			if maliciousVote {
+				evidence := types.NewSlashIndicatorFinalityEvidenceWrapper(voteEnvelope, newVote)
+				if evidence != nil {
+					if evidenceJson, err := json.Marshal(evidence); err == nil {
+						log.Warn("MaliciousVote", "evidence", string(evidenceJson))
+					} else {
+						log.Warn("MaliciousVote, Marshal evidence failed")
+					}
+				} else {
+					log.Warn("MaliciousVote, construct evidence failed")
+				}
 				return true
 			}
 		}
 	}
 
 	// for simplicity, Just override even if the targetNumber has existed.
-	voteDataBuffer.Add(newVote.Data.TargetNumber, newVote.Data)
+	voteDataBuffer.Add(newVote.Data.TargetNumber, newVote)
 	return false
 }

@@ -45,9 +45,6 @@ func (d *Downloader) fetchHeadersByHash(p *peerConnection, hash common.Hash, amo
 	defer timeoutTimer.Stop()
 
 	select {
-	case <-d.cancelCh:
-		return nil, nil, errCanceled
-
 	case <-timeoutTimer.C:
 		// Header retrieval timed out, update the metrics
 		p.log.Debug("Header request timed out", "elapsed", ttl)
@@ -58,14 +55,14 @@ func (d *Downloader) fetchHeadersByHash(p *peerConnection, hash common.Hash, amo
 	case res := <-resCh:
 		// Headers successfully retrieved, update the metrics
 		headerReqTimer.Update(time.Since(start))
-		headerInMeter.Mark(int64(len(*res.Res.(*eth.BlockHeadersPacket))))
+		headerInMeter.Mark(int64(len(*res.Res.(*eth.BlockHeadersRequest))))
 
 		// Don't reject the packet even if it turns out to be bad, downloader will
 		// disconnect the peer on its own terms. Simply delivery the headers to
 		// be processed by the caller
 		res.Done <- nil
 
-		return *res.Res.(*eth.BlockHeadersPacket), res.Meta.([]common.Hash), nil
+		return *res.Res.(*eth.BlockHeadersRequest), res.Meta.([]common.Hash), nil
 	}
 }
 
@@ -103,13 +100,13 @@ func (d *Downloader) fetchHeadersByNumber(p *peerConnection, number uint64, amou
 	case res := <-resCh:
 		// Headers successfully retrieved, update the metrics
 		headerReqTimer.Update(time.Since(start))
-		headerInMeter.Mark(int64(len(*res.Res.(*eth.BlockHeadersPacket))))
+		headerInMeter.Mark(int64(len(*res.Res.(*eth.BlockHeadersRequest))))
 
 		// Don't reject the packet even if it turns out to be bad, downloader will
 		// disconnect the peer on its own terms. Simply delivery the headers to
 		// be processed by the caller
 		res.Done <- nil
 
-		return *res.Res.(*eth.BlockHeadersPacket), res.Meta.([]common.Hash), nil
+		return *res.Res.(*eth.BlockHeadersRequest), res.Meta.([]common.Hash), nil
 	}
 }

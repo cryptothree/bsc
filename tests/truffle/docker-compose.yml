@@ -1,11 +1,8 @@
-version: "3"
-
 services:
   genesis:
     image: bsc-genesis
     env_file: .env
     environment:
-      INIT_HOLDER_BALANCE: "500000000000000000000"
       NUMS_OF_VALIDATOR: 1
     volumes:
       - ./storage:/root/storage
@@ -29,6 +26,9 @@ services:
       - ./scripts:/scripts
       - ./config:/config
     entrypoint: [ "sh", "-c", "/scripts/bsc-rpc.sh" ]
+    networks:
+      default:
+        ipv4_address: 99.1.0.3
 
   bsc-validator1:
     image: bsc
@@ -40,6 +40,9 @@ services:
       - ./storage/bsc-validator1:/root/.ethereum
       - ./scripts:/scripts
     entrypoint: [ "sh", "-c", "/scripts/bsc-validator.sh" ]
+    networks:
+      default:
+        ipv4_address: 99.1.0.2
   
   truffle-test:
     image: truffle-test

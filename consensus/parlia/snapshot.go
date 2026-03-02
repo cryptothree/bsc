@@ -22,31 +22,35 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 
-	lru "github.com/hashicorp/golang-lru"
-
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/lru"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/internal/ethapi"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/willf/bitset"
 )
 
 // Snapshot is the state of the validatorSet at a given point.
 type Snapshot struct {
 	config   *params.ParliaConfig // Consensus engine parameters to fine tune behavior
-	ethAPI   *ethapi.PublicBlockChainAPI
-	sigCache *lru.ARCCache // Cache of recent block signatures to speed up ecrecover
+	ethAPI   *ethapi.BlockChainAPI
+	sigCache *lru.Cache[common.Hash, common.Address] // Cache of recent block signatures to speed up ecrecover
 
 	Number           uint64                            `json:"number"`                // Block number where the snapshot was created
 	Hash             common.Hash                       `json:"hash"`                  // Block hash where the snapshot was created
+	EpochLength      uint64                            `json:"epoch_length"`          // Number of Blocks in one epoch
+	BlockInterval    uint64                            `json:"block_interval"`        // Block Interval in milliseconds
+	TurnLength       uint8                             `json:"turn_length"`           // Length of `turn`, meaning the consecutive number of blocks a validator receives priority for block production
 	Validators       map[common.Address]*ValidatorInfo `json:"validators"`            // Set of authorized validators at this moment
 	Recents          map[uint64]common.Address         `json:"recents"`               // Set of recent validators for spam protections
 	RecentForkHashes map[uint64]string                 `json:"recent_fork_hashes"`    // Set of recent forkHash
-	Attestation      *types.VoteData                   `json:"attestation:omitempty"` // Attestation for fast finality
+	Attestation      *types.VoteData                   `json:"attestation:omitempty"` // Attestation for fast finality, but `Source` used as `Finalized`
 }
 
 type ValidatorInfo struct {
@@ -59,12 +63,12 @@ type ValidatorInfo struct {
 // the genesis block.
 func newSnapshot(
 	config *params.ParliaConfig,
-	sigCache *lru.ARCCache,
+	sigCache *lru.Cache[common.Hash, common.Address],
 	number uint64,
 	hash common.Hash,
 	validators []common.Address,
 	voteAddrs []types.BLSPublicKey,
-	ethAPI *ethapi.PublicBlockChainAPI,
+	ethAPI *ethapi.BlockChainAPI,
 ) *Snapshot {
 	snap := &Snapshot{
 		config:           config,
@@ -72,6 +76,9 @@ func newSnapshot(
 		sigCache:         sigCache,
 		Number:           number,
 		Hash:             hash,
+		EpochLength:      defaultEpochLength,
+		BlockInterval:    defaultBlockInterval,
+		TurnLength:       defaultTurnLength,
 		Recents:          make(map[uint64]common.Address),
 		RecentForkHashes: make(map[uint64]string),
 		Validators:       make(map[common.Address]*ValidatorInfo),
@@ -105,7 +112,7 @@ func (s validatorsAscending) Less(i, j int) bool { return bytes.Compare(s[i][:],
 func (s validatorsAscending) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
 
 // loadSnapshot loads an existing snapshot from the database.
-func loadSnapshot(config *params.ParliaConfig, sigCache *lru.ARCCache, db ethdb.Database, hash common.Hash, ethAPI *ethapi.PublicBlockChainAPI) (*Snapshot, error) {
+func loadSnapshot(config *params.ParliaConfig, sigCache *lru.Cache[common.Hash, common.Address], db ethdb.Database, hash common.Hash, ethAPI *ethapi.BlockChainAPI) (*Snapshot, error) {
 	blob, err := db.Get(append([]byte("parlia-"), hash[:]...))
 	if err != nil {
 		return nil, err
@@ -114,6 +121,16 @@ func loadSnapshot(config *params.ParliaConfig, sigCache *lru.ARCCache, db ethdb.
 	if err := json.Unmarshal(blob, snap); err != nil {
 		return nil, err
 	}
+	if snap.EpochLength == 0 { // no EpochLength field in old snapshots
+		snap.EpochLength = defaultEpochLength
+	}
+	if snap.BlockInterval == 0 { // no BlockInterval field in old snapshots
+		snap.BlockInterval = defaultBlockInterval
+	}
+	if snap.TurnLength == 0 { // no TurnLength field in old snapshots
+		snap.TurnLength = defaultTurnLength
+	}
+
 	snap.config = config
 	snap.sigCache = sigCache
 	snap.ethAPI = ethAPI
@@ -138,6 +155,9 @@ func (s *Snapshot) copy() *Snapshot {
 		sigCache:         s.sigCache,
 		Number:           s.Number,
 		Hash:             s.Hash,
+		EpochLength:      s.EpochLength,
+		BlockInterval:    s.BlockInterval,
+		TurnLength:       s.TurnLength,
 		Validators:       make(map[common.Address]*ValidatorInfo),
 		Recents:          make(map[uint64]common.Address),
 		RecentForkHashes: make(map[uint64]string),
@@ -176,46 +196,90 @@ func (s *Snapshot) isMajorityFork(forkHash string) bool {
 	return ally > len(s.RecentForkHashes)/2
 }
 
-func (s *Snapshot) updateAttestation(header *types.Header, chainConfig *params.ChainConfig, parliaConfig *params.ParliaConfig) {
+func (s *Snapshot) updateAttestation(header *types.Header, chainConfig *params.ChainConfig) {
 	if !chainConfig.IsLuban(header.Number) {
 		return
 	}
 
 	// The attestation should have been checked in verify header, update directly
-	attestation, _ := getVoteAttestationFromHeader(header, chainConfig, parliaConfig)
+	attestation, _ := getVoteAttestationFromHeader(header, chainConfig, s.EpochLength)
 	if attestation == nil {
 		return
 	}
 
 	// Headers with bad attestation are accepted before Plato upgrade,
-	// but Attestation of snapshot is only updated when the target block is direct parent of the header
-	targetNumber := attestation.Data.TargetNumber
-	targetHash := attestation.Data.TargetHash
-	if targetHash != header.ParentHash || targetNumber+1 != header.Number.Uint64() {
-		log.Warn("updateAttestation failed", "error", fmt.Errorf("invalid attestation, target mismatch, expected block: %d, hash: %s; real block: %d, hash: %s",
-			header.Number.Uint64()-1, header.ParentHash, targetNumber, targetHash))
-		updateAttestationErrorCounter.Inc(1)
-		return
+	// but Attestation of snapshot is only updated when the target block is direct parent of the header before Fermi upgrade
+	if !chainConfig.IsFermi(header.Number, header.Time) {
+		targetNumber := attestation.Data.TargetNumber
+		targetHash := attestation.Data.TargetHash
+		if targetHash != header.ParentHash || targetNumber+1 != header.Number.Uint64() {
+			log.Warn("updateAttestation failed", "error", fmt.Errorf("invalid attestation, target mismatch, expected block: %d, hash: %s; real block: %d, hash: %s",
+				header.Number.Uint64()-1, header.ParentHash, targetNumber, targetHash))
+			updateAttestationErrorCounter.Inc(1)
+			return
+		}
 	}
 
+	// Update vote count metric after validation passed
+	voteCount := bitset.From([]uint64{uint64(attestation.VoteAddressSet)}).Count()
+	attestationVoteCountGauge.Update(int64(voteCount))
+
 	// Update attestation
-	s.Attestation = &types.VoteData{
-		SourceNumber: attestation.Data.SourceNumber,
-		SourceHash:   attestation.Data.SourceHash,
-		TargetNumber: attestation.Data.TargetNumber,
-		TargetHash:   attestation.Data.TargetHash,
+	// Two scenarios for s.Attestation being nil:
+	// 1) The first attestation is assembled.
+	// 2) The snapshot on disk is missing, prompting the creation of a new snapshot using `newSnapshot`.
+	if s.Attestation != nil && attestation.Data.SourceNumber+1 != attestation.Data.TargetNumber {
+		s.Attestation.TargetNumber = attestation.Data.TargetNumber
+		s.Attestation.TargetHash = attestation.Data.TargetHash
+	} else {
+		s.Attestation = attestation.Data
 	}
 }
 
-func (s *Snapshot) SignRecently(validator common.Address) bool {
-	for seen, recent := range s.Recents {
-		if recent == validator {
-			if limit := uint64(len(s.Validators)/2 + 1); s.Number+1 < limit || seen > s.Number+1-limit {
-				return true
-			}
-		}
+func (s *Snapshot) versionHistoryCheckLen() uint64 {
+	return uint64(len(s.Validators)) * uint64(s.TurnLength)
+}
+
+func (s *Snapshot) minerHistoryCheckLen() uint64 {
+	return (uint64(len(s.Validators))/2+1)*uint64(s.TurnLength) - 1
+}
+
+func (s *Snapshot) countRecents() map[common.Address]uint8 {
+	leftHistoryBound := uint64(0) // the bound is excluded
+	checkHistoryLength := s.minerHistoryCheckLen()
+	if s.Number > checkHistoryLength {
+		leftHistoryBound = s.Number - checkHistoryLength
 	}
+	counts := make(map[common.Address]uint8, len(s.Validators))
+	for seen, recent := range s.Recents {
+		if seen <= leftHistoryBound || recent == (common.Address{}) /*when seen == `epochKey`*/ {
+			continue
+		}
+		counts[recent] += 1
+	}
+	return counts
+}
+
+func (s *Snapshot) signRecentlyByCounts(validator common.Address, counts map[common.Address]uint8) bool {
+	if seenTimes, ok := counts[validator]; ok && seenTimes >= s.TurnLength {
+		if seenTimes > s.TurnLength {
+			log.Warn("produce more blocks than expected!", "validator", validator, "seenTimes", seenTimes)
+		}
+		return true
+	}
+
 	return false
+}
+
+func (s *Snapshot) SignRecently(validator common.Address) bool {
+	return s.signRecentlyByCounts(validator, s.countRecents())
+}
+
+func (s *Snapshot) getFinalizedNumber() uint64 {
+	if s.Attestation != nil {
+		return s.Attestation.SourceNumber
+	}
+	return 0
 }
 
 func (s *Snapshot) apply(headers []*types.Header, chain consensus.ChainHeaderReader, parents []*types.Header, chainConfig *params.ChainConfig) (*Snapshot, error) {
@@ -244,10 +308,10 @@ func (s *Snapshot) apply(headers []*types.Header, chain consensus.ChainHeaderRea
 	for _, header := range headers {
 		number := header.Number.Uint64()
 		// Delete the oldest validator from the recent list to allow it signing again
-		if limit := uint64(len(snap.Validators)/2 + 1); number >= limit {
+		if limit := snap.minerHistoryCheckLen() + 1; number >= limit {
 			delete(snap.Recents, number-limit)
 		}
-		if limit := uint64(len(snap.Validators)); number >= limit {
+		if limit := snap.versionHistoryCheckLen(); number >= limit {
 			delete(snap.RecentForkHashes, number-limit)
 		}
 		// Resolve the authorization key and check against signers
@@ -256,23 +320,85 @@ func (s *Snapshot) apply(headers []*types.Header, chain consensus.ChainHeaderRea
 			return nil, err
 		}
 		if _, ok := snap.Validators[validator]; !ok {
-			return nil, errUnauthorizedValidator
+			return nil, errUnauthorizedValidator(validator.String())
 		}
-		for _, recent := range snap.Recents {
-			if recent == validator {
+		if chainConfig.IsBohr(header.Number, header.Time) {
+			if snap.SignRecently(validator) {
 				return nil, errRecentlySigned
 			}
+		} else {
+			for _, recent := range snap.Recents {
+				if recent == validator {
+					return nil, errRecentlySigned
+				}
+			}
 		}
+
+		snap.updateAttestation(header, chainConfig)
+
 		snap.Recents[number] = validator
+		if chainConfig.IsMaxwell(header.Number, header.Time) {
+			latestFinalizedBlockNumber := snap.getFinalizedNumber()
+			// BEP-524: Clear entries up to the latest finalized block
+			for blockNumber := range snap.Recents {
+				if blockNumber <= latestFinalizedBlockNumber {
+					delete(snap.Recents, blockNumber)
+				}
+			}
+		}
+
+		snap.RecentForkHashes[number] = hex.EncodeToString(header.Extra[extraVanity-nextForkHashSize : extraVanity])
+
+		if chainConfig.IsFermi(header.Number, header.Time) {
+			snap.BlockInterval = fermiBlockInterval
+		} else if chainConfig.IsMaxwell(header.Number, header.Time) {
+			snap.BlockInterval = maxwellBlockInterval
+		} else if chainConfig.IsLorentz(header.Number, header.Time) {
+			snap.BlockInterval = lorentzBlockInterval
+		}
+
+		epochLength := snap.EpochLength
+		nextBlockNumber := header.Number.Uint64() + 1
+		if snap.EpochLength == defaultEpochLength &&
+			chainConfig.IsLorentz(header.Number, header.Time) &&
+			// Without this condition, an incorrect block might be used to parse validators for certain blocks after the Lorentz hard fork.
+			nextBlockNumber%lorentzEpochLength == 0 {
+			snap.EpochLength = lorentzEpochLength
+		}
+		if snap.EpochLength == lorentzEpochLength &&
+			chainConfig.IsMaxwell(header.Number, header.Time) &&
+			nextBlockNumber%maxwellEpochLength == 0 {
+			snap.EpochLength = maxwellEpochLength
+		}
 		// change validator set
-		if number > 0 && number%s.config.Epoch == uint64(len(snap.Validators)/2) {
-			checkpointHeader := FindAncientHeader(header, uint64(len(snap.Validators)/2), chain, parents)
+		if number > 0 && number%epochLength == snap.minerHistoryCheckLen() {
+			epochKey := math.MaxUint64 - header.Number.Uint64()/epochLength // impossible used as a block number
+			if chainConfig.IsBohr(header.Number, header.Time) {
+				// after switching the validator set, snap.Validators may become larger,
+				// then the unexpected second switch will happen, just skip it.
+				if _, ok := snap.Recents[epochKey]; ok {
+					continue
+				}
+			}
+
+			checkpointHeader := FindAncientHeader(header, snap.minerHistoryCheckLen(), chain, parents)
 			if checkpointHeader == nil {
 				return nil, consensus.ErrUnknownAncestor
 			}
 
+			oldVersionsLen := snap.versionHistoryCheckLen()
+			// get turnLength from headers and use that for new turnLength
+			turnLength, err := parseTurnLength(checkpointHeader, chainConfig, epochLength)
+			if err != nil {
+				return nil, err
+			}
+			if turnLength != nil {
+				snap.TurnLength = *turnLength
+				log.Debug("validator set switch", "turnLength", *turnLength)
+			}
+
 			// get validators from headers and use that for new validator set
-			newValArr, voteAddrs, err := parseValidators(checkpointHeader, chainConfig, s.config)
+			newValArr, voteAddrs, err := parseValidators(checkpointHeader, chainConfig, epochLength)
 			if err != nil {
 				return nil, err
 			}
@@ -286,18 +412,18 @@ func (s *Snapshot) apply(headers []*types.Header, chain consensus.ChainHeaderRea
 					}
 				}
 			}
-			oldLimit := len(snap.Validators)/2 + 1
-			newLimit := len(newVals)/2 + 1
-			if newLimit < oldLimit {
-				for i := 0; i < oldLimit-newLimit; i++ {
-					delete(snap.Recents, number-uint64(newLimit)-uint64(i))
-				}
-			}
-			oldLimit = len(snap.Validators)
-			newLimit = len(newVals)
-			if newLimit < oldLimit {
-				for i := 0; i < oldLimit-newLimit; i++ {
-					delete(snap.RecentForkHashes, number-uint64(newLimit)-uint64(i))
+			if chainConfig.IsBohr(header.Number, header.Time) {
+				// BEP-404: Clear Miner History when Switching Validators Set
+				snap.Recents = make(map[uint64]common.Address)
+				snap.Recents[epochKey] = common.Address{}
+				log.Debug("Recents are cleared up", "blockNumber", number)
+			} else {
+				oldLimit := len(snap.Validators)/2 + 1
+				newLimit := len(newVals)/2 + 1
+				if newLimit < oldLimit {
+					for i := 0; i < oldLimit-newLimit; i++ {
+						delete(snap.Recents, number-uint64(newLimit)-uint64(i))
+					}
 				}
 			}
 			snap.Validators = newVals
@@ -307,11 +433,10 @@ func (s *Snapshot) apply(headers []*types.Header, chain consensus.ChainHeaderRea
 					snap.Validators[val].Index = idx + 1 // offset by 1
 				}
 			}
+			for i := snap.versionHistoryCheckLen(); i < oldVersionsLen; i++ {
+				delete(snap.RecentForkHashes, number-i)
+			}
 		}
-
-		snap.updateAttestation(header, chainConfig, s.config)
-
-		snap.RecentForkHashes[number] = hex.EncodeToString(header.Extra[extraVanity-nextForkHashSize : extraVanity])
 	}
 	snap.Number += uint64(len(headers))
 	snap.Hash = headers[len(headers)-1].Hash()
@@ -328,11 +453,53 @@ func (s *Snapshot) validators() []common.Address {
 	return validators
 }
 
+// lastBlockInOneTurn returns if the block at height `blockNumber` is the last block in current turn.
+func (s *Snapshot) lastBlockInOneTurn(blockNumber uint64) bool {
+	return (blockNumber+1)%uint64(s.TurnLength) == 0
+}
+
 // inturn returns if a validator at a given block height is in-turn or not.
 func (s *Snapshot) inturn(validator common.Address) bool {
+	return s.inturnValidator() == validator
+}
+
+// inturnValidator returns the validator for the following block height.
+func (s *Snapshot) inturnValidator() common.Address {
 	validators := s.validators()
-	offset := (s.Number + 1) % uint64(len(validators))
-	return validators[offset] == validator
+	offset := (s.Number + 1) / uint64(s.TurnLength) % uint64(len(validators))
+	return validators[offset]
+}
+
+func (s *Snapshot) nexValidatorsChangeBlock() uint64 {
+	epochLength := s.EpochLength
+	currentEpoch := s.Number - s.Number%epochLength
+	checkLen := s.minerHistoryCheckLen()
+	if s.Number%epochLength < checkLen {
+		return currentEpoch + checkLen
+	}
+	return currentEpoch + epochLength + checkLen
+}
+
+// nextProposalBlock returns the validator next proposal block.
+func (s *Snapshot) nextProposalBlock(proposer common.Address) (uint64, uint64, error) {
+	validators := s.validators()
+	currentIndex := int(s.Number / uint64(s.TurnLength) % uint64(len(validators)))
+	expectIndex := s.indexOfVal(proposer)
+	if expectIndex < 0 {
+		return 0, 0, errors.New("proposer not in validator set")
+	}
+	startBlock := s.Number + uint64(((expectIndex+len(validators)-currentIndex)%len(validators))*int(s.TurnLength))
+	startBlock = startBlock - startBlock%uint64(s.TurnLength)
+	endBlock := startBlock + uint64(s.TurnLength) - 1
+
+	changeValidatorsBlock := s.nexValidatorsChangeBlock()
+	if startBlock >= changeValidatorsBlock {
+		return 0, 0, errors.New("next proposal block is out of current epoch")
+	}
+	if endBlock >= changeValidatorsBlock {
+		endBlock = changeValidatorsBlock
+	}
+	return startBlock, endBlock, nil
 }
 
 func (s *Snapshot) enoughDistance(validator common.Address, header *types.Header) bool {
@@ -369,14 +536,8 @@ func (s *Snapshot) indexOfVal(validator common.Address) int {
 	return -1
 }
 
-func (s *Snapshot) supposeValidator() common.Address {
-	validators := s.validators()
-	index := (s.Number + 1) % uint64(len(validators))
-	return validators[index]
-}
-
-func parseValidators(header *types.Header, chainConfig *params.ChainConfig, parliaConfig *params.ParliaConfig) ([]common.Address, []types.BLSPublicKey, error) {
-	validatorsBytes := getValidatorBytesFromHeader(header, chainConfig, parliaConfig)
+func parseValidators(header *types.Header, chainConfig *params.ChainConfig, epochLength uint64) ([]common.Address, []types.BLSPublicKey, error) {
+	validatorsBytes := getValidatorBytesFromHeader(header, chainConfig, epochLength)
 	if len(validatorsBytes) == 0 {
 		return nil, nil, errors.New("invalid validators bytes")
 	}
@@ -398,6 +559,24 @@ func parseValidators(header *types.Header, chainConfig *params.ChainConfig, parl
 		copy(voteAddrs[i][:], validatorsBytes[i*validatorBytesLength+common.AddressLength:(i+1)*validatorBytesLength])
 	}
 	return cnsAddrs, voteAddrs, nil
+}
+
+func parseTurnLength(header *types.Header, chainConfig *params.ChainConfig, epochLength uint64) (*uint8, error) {
+	if header.Number.Uint64()%epochLength != 0 ||
+		!chainConfig.IsBohr(header.Number, header.Time) {
+		return nil, nil
+	}
+
+	if len(header.Extra) <= extraVanity+extraSeal {
+		return nil, errInvalidSpanValidators
+	}
+	num := int(header.Extra[extraVanity])
+	pos := extraVanity + validatorNumberSize + num*validatorBytesLength
+	if len(header.Extra) <= pos {
+		return nil, errInvalidTurnLength
+	}
+	turnLength := header.Extra[pos]
+	return &turnLength, nil
 }
 
 func FindAncientHeader(header *types.Header, ite uint64, chain consensus.ChainHeaderReader, candidateParents []*types.Header) *types.Header {

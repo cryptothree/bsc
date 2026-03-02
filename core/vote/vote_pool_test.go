@@ -20,8 +20,8 @@ import (
 	"container/heap"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io/ioutil"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -29,10 +29,10 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/prysmaticlabs/prysm/v4/crypto/bls"
-	"github.com/prysmaticlabs/prysm/v4/validator/accounts"
-	"github.com/prysmaticlabs/prysm/v4/validator/accounts/iface"
-	"github.com/prysmaticlabs/prysm/v4/validator/keymanager"
+	"github.com/prysmaticlabs/prysm/v5/crypto/bls"
+	"github.com/prysmaticlabs/prysm/v5/validator/accounts"
+	"github.com/prysmaticlabs/prysm/v5/validator/accounts/iface"
+	"github.com/prysmaticlabs/prysm/v5/validator/keymanager"
 	keystorev4 "github.com/wealdtech/go-eth2-wallet-encryptor-keystorev4"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -41,7 +41,6 @@ import (
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/eth/downloader"
 	"github.com/ethereum/go-ethereum/event"
@@ -68,32 +67,51 @@ type mockInvalidPOSA struct {
 	consensus.PoSA
 }
 
-func (p *mockPOSA) GetJustifiedNumberAndHash(chain consensus.ChainHeaderReader, header *types.Header) (uint64, common.Hash, error) {
-	parentHeader := chain.GetHeaderByHash(header.ParentHash)
+// testBackend is a mock implementation of the live Ethereum message handler.
+type testBackend struct {
+	eventMux *event.TypeMux
+}
+
+func newTestBackend() *testBackend {
+	return &testBackend{eventMux: new(event.TypeMux)}
+}
+func (b *testBackend) IsMining() bool           { return true }
+func (b *testBackend) EventMux() *event.TypeMux { return b.eventMux }
+
+func (mp *mockPOSA) GetJustifiedNumberAndHash(chain consensus.ChainHeaderReader, headers []*types.Header) (uint64, common.Hash, error) {
+	parentHeader := chain.GetHeaderByHash(headers[len(headers)-1].ParentHash)
 	if parentHeader == nil {
-		return 0, common.Hash{}, fmt.Errorf("unexpected error")
+		return 0, common.Hash{}, errors.New("unexpected error")
 	}
 	return parentHeader.Number.Uint64(), parentHeader.Hash(), nil
 }
 
-func (p *mockInvalidPOSA) GetJustifiedNumberAndHash(chain consensus.ChainHeaderReader, header *types.Header) (uint64, common.Hash, error) {
-	return 0, common.Hash{}, fmt.Errorf("not supported")
+func (mip *mockInvalidPOSA) GetJustifiedNumberAndHash(chain consensus.ChainHeaderReader, headers []*types.Header) (uint64, common.Hash, error) {
+	return 0, common.Hash{}, errors.New("not supported")
 }
 
-func (m *mockPOSA) VerifyVote(chain consensus.ChainHeaderReader, vote *types.VoteEnvelope) error {
+func (mp *mockPOSA) VerifyVote(chain consensus.ChainHeaderReader, vote *types.VoteEnvelope) error {
 	return nil
 }
 
-func (m *mockInvalidPOSA) VerifyVote(chain consensus.ChainHeaderReader, vote *types.VoteEnvelope) error {
+func (mip *mockInvalidPOSA) VerifyVote(chain consensus.ChainHeaderReader, vote *types.VoteEnvelope) error {
 	return nil
 }
 
-func (m *mockPOSA) IsActiveValidatorAt(chain consensus.ChainHeaderReader, header *types.Header) bool {
+func (mp *mockPOSA) IsActiveValidatorAt(chain consensus.ChainHeaderReader, header *types.Header, checkVoteKeyFn func(bLSPublicKey *types.BLSPublicKey) bool) bool {
 	return true
 }
 
-func (m *mockInvalidPOSA) IsActiveValidatorAt(chain consensus.ChainHeaderReader, header *types.Header) bool {
+func (mip *mockInvalidPOSA) IsActiveValidatorAt(chain consensus.ChainHeaderReader, header *types.Header, checkVoteKeyFn func(bLSPublicKey *types.BLSPublicKey) bool) bool {
 	return true
+}
+
+func (mp *mockPOSA) CheckFinalityAndNotify(chain consensus.ChainHeaderReader, targetBlockHash common.Hash, notifyFn func(finalizedHeader *types.Header)) {
+	// No-op for testing
+}
+
+func (mip *mockInvalidPOSA) CheckFinalityAndNotify(chain consensus.ChainHeaderReader, targetBlockHash common.Hash, notifyFn func(finalizedHeader *types.Header)) {
+	// No-op for testing
 }
 
 func (pool *VotePool) verifyStructureSizeOfVotePool(receivedVotes, curVotes, futureVotes, curVotesPq, futureVotesPq int) bool {
@@ -112,11 +130,10 @@ func (journal *VoteJournal) verifyJournal(size, lastLatestVoteNumber int) bool {
 		lastIndex, _ := journal.walLog.LastIndex()
 		firstIndex, _ := journal.walLog.FirstIndex()
 		if int(lastIndex)-int(firstIndex)+1 == size {
-			return true
-		}
-		lastVote, _ := journal.ReadVote(lastIndex)
-		if lastVote != nil && lastVote.Data.TargetNumber == uint64(lastLatestVoteNumber) {
-			return true
+			lastVote, _ := journal.ReadVote(lastIndex)
+			if lastVote != nil && lastVote.Data.TargetNumber == uint64(lastLatestVoteNumber)+blocksNumberSinceMining {
+				return true
+			}
 		}
 	}
 	return false
@@ -133,16 +150,14 @@ func TestInvalidVotePool(t *testing.T) {
 func testVotePool(t *testing.T, isValidRules bool) {
 	walletPasswordDir, walletDir := setUpKeyManager(t)
 
-	// Create a database pre-initialize with a genesis block
-	db := rawdb.NewMemoryDatabase()
-	(&core.Genesis{
+	genesis := &core.Genesis{
 		Config: params.TestChainConfig,
-		Alloc:  core.GenesisAlloc{testAddr: {Balance: big.NewInt(1000000)}},
-	}).MustCommit(db)
-
-	chain, _ := core.NewBlockChain(db, nil, params.TestChainConfig, ethash.NewFullFaker(), vm.Config{}, nil, nil)
+		Alloc:  types.GenesisAlloc{testAddr: {Balance: big.NewInt(1000000)}},
+	}
 
 	mux := new(event.TypeMux)
+	db := rawdb.NewMemoryDatabase()
+	chain, _ := core.NewBlockChain(db, genesis, ethash.NewFullFaker(), nil)
 
 	var mockEngine consensus.PoSA
 	if isValidRules {
@@ -152,11 +167,11 @@ func testVotePool(t *testing.T, isValidRules bool) {
 	}
 
 	// Create vote pool
-	votePool := NewVotePool(params.TestChainConfig, chain, mockEngine)
+	votePool := NewVotePool(chain, mockEngine)
 
 	// Create vote manager
 	// Create a temporary file for the votes journal
-	file, err := ioutil.TempFile("", "")
+	file, err := os.CreateTemp("", "")
 	if err != nil {
 		t.Fatalf("failed to create temporary file path: %v", err)
 	}
@@ -167,7 +182,7 @@ func testVotePool(t *testing.T, isValidRules bool) {
 	file.Close()
 	os.Remove(journal)
 
-	voteManager, err := NewVoteManager(mux, params.TestChainConfig, chain, votePool, journal, walletPasswordDir, walletDir, mockEngine)
+	voteManager, err := NewVoteManager(newTestBackend(), chain, votePool, journal, walletPasswordDir, walletDir, mockEngine)
 	if err != nil {
 		t.Fatalf("failed to create vote managers")
 	}
@@ -182,7 +197,7 @@ func testVotePool(t *testing.T, isValidRules bool) {
 	if _, err := chain.InsertChain(bs); err != nil {
 		panic(err)
 	}
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 10+blocksNumberSinceMining; i++ {
 		bs, _ = core.GenerateChain(params.TestChainConfig, bs[len(bs)-1], ethash.NewFaker(), db, 1, nil)
 		if _, err := chain.InsertChain(bs); err != nil {
 			panic(err)
@@ -274,10 +289,10 @@ func testVotePool(t *testing.T, isValidRules bool) {
 		t.Fatalf("journal failed")
 	}
 
-	// Test future votes scenario: votes number within latestBlockHeader ~ latestBlockHeader + 13
+	// Test future votes scenario: votes number within latestBlockHeader ~ latestBlockHeader + 11
 	futureVote := &types.VoteEnvelope{
 		Data: &types.VoteData{
-			TargetNumber: 279,
+			TargetNumber: 314,
 		},
 	}
 	if err := voteManager.signer.SignVote(futureVote); err != nil {
@@ -297,7 +312,7 @@ func testVotePool(t *testing.T, isValidRules bool) {
 	// Test duplicate vote case, shouldn'd be put into vote pool
 	duplicateVote := &types.VoteEnvelope{
 		Data: &types.VoteData{
-			TargetNumber: 279,
+			TargetNumber: 314,
 		},
 	}
 	if err := voteManager.signer.SignVote(duplicateVote); err != nil {
@@ -326,14 +341,14 @@ func testVotePool(t *testing.T, isValidRules bool) {
 		t.Fatalf("put vote failed")
 	}
 
-	// Test transfer votes from future to cur, latest block header is #288 after the following generation
-	// For the above BlockNumber 279, it did not have blockHash, should be assigned as well below.
-	curNumber := 268
+	// Test transfer votes from future to cur, latest block header is #328 after the following generation
+	// For the above BlockNumber 314, it did not have blockHash, should be assigned as well below.
+	curNumber := 308
 	var futureBlockHash common.Hash
 	for i := 0; i < 20; i++ {
 		bs, _ = core.GenerateChain(params.TestChainConfig, bs[len(bs)-1], ethash.NewFaker(), db, 1, nil)
 		curNumber += 1
-		if curNumber == 279 {
+		if curNumber == 314 {
 			futureBlockHash = bs[0].Hash()
 			futureVotesMap := votePool.futureVotes
 			voteBox := futureVotesMap[common.Hash{}]
@@ -406,7 +421,7 @@ func setUpKeyManager(t *testing.T) (string, string) {
 	if err := os.MkdirAll(filepath.Dir(walletPasswordDir), 0700); err != nil {
 		t.Fatalf("failed to create walletPassword dir: %v", err)
 	}
-	if err := ioutil.WriteFile(walletPasswordDir, []byte(password), 0600); err != nil {
+	if err := os.WriteFile(walletPasswordDir, []byte(password), 0600); err != nil {
 		t.Fatalf("failed to write wallet password dir: %v", err)
 	}
 

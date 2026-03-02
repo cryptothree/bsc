@@ -1,4 +1,4 @@
-// Copyright 2017 The go-ethereum Authors
+// Copyright 2021 The go-ethereum Authors
 // This file is part of the go-ethereum library.
 //
 // The go-ethereum library is free software: you can redistribute it and/or modify
@@ -18,11 +18,7 @@
 package ethconfig
 
 import (
-	"math/big"
-	"os"
-	"os/user"
-	"path/filepath"
-	"runtime"
+	"errors"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -32,13 +28,15 @@ import (
 	"github.com/ethereum/go-ethereum/consensus/ethash"
 	"github.com/ethereum/go-ethereum/consensus/parlia"
 	"github.com/ethereum/go-ethereum/core"
-	"github.com/ethereum/go-ethereum/eth/downloader"
+	"github.com/ethereum/go-ethereum/core/history"
+	"github.com/ethereum/go-ethereum/core/txpool/blobpool"
+	"github.com/ethereum/go-ethereum/core/txpool/legacypool"
 	"github.com/ethereum/go-ethereum/eth/gasprice"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/internal/ethapi"
 	"github.com/ethereum/go-ethereum/log"
-	"github.com/ethereum/go-ethereum/miner"
-	"github.com/ethereum/go-ethereum/node"
+	"github.com/ethereum/go-ethereum/miner/minerconfig"
+	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/params"
 )
 
@@ -51,85 +49,48 @@ var FullNodeGPO = gasprice.Config{
 	IgnorePrice:     gasprice.DefaultIgnorePrice,
 }
 
-// LightClientGPO contains default gasprice oracle settings for light client.
-var LightClientGPO = gasprice.Config{
-	Blocks:      2,
-	Percentile:  60,
-	MaxPrice:    gasprice.DefaultMaxPrice,
-	IgnorePrice: gasprice.DefaultIgnorePrice,
-}
-
-// Defaults contains default settings for use on the Ethereum main net.
+// Defaults contains default settings for use on the BSC main net.
 var Defaults = Config{
-	SyncMode: downloader.SnapSync,
-	Ethash: ethash.Config{
-		CacheDir:         "ethash",
-		CachesInMem:      2,
-		CachesOnDisk:     3,
-		CachesLockMmap:   false,
-		DatasetsInMem:    1,
-		DatasetsOnDisk:   2,
-		DatasetsLockMmap: false,
-	},
-	NetworkId:               1,
-	TxLookupLimit:           2350000,
-	LightPeers:              100,
-	UltraLightFraction:      75,
-	DatabaseCache:           512,
-	TrieCleanCache:          154,
-	TrieCleanCacheJournal:   "triecache",
-	TrieCleanCacheRejournal: 60 * time.Minute,
-	TrieDirtyCache:          256,
-	TrieTimeout:             60 * time.Minute,
-	TriesInMemory:           128,
-	TriesVerifyMode:         core.LocalVerify,
-	SnapshotCache:           102,
-	DiffBlock:               uint64(86400),
-	Miner: miner.Config{
-		GasCeil:       8000000,
-		GasPrice:      big.NewInt(params.GWei),
-		Recommit:      3 * time.Second,
-		DelayLeftOver: 50 * time.Millisecond,
-	},
-	TxPool:        core.DefaultTxPoolConfig,
-	RPCGasCap:     50000000,
-	RPCEVMTimeout: 5 * time.Second,
-	GPO:           FullNodeGPO,
-	RPCTxFeeCap:   1, // 1 ether
+	HistoryMode:            history.KeepAll,
+	SyncMode:               SnapSync,
+	NetworkId:              0, // enable auto configuration of networkID == chainID
+	TxLookupLimit:          2350000,
+	TransactionHistory:     2350000,
+	BlockHistory:           0,
+	StateHistory:           params.FullImmutabilityThreshold,
+	DatabaseCache:          512,
+	TrieCleanCache:         154,
+	TrieDirtyCache:         256,
+	TrieTimeout:            10 * time.Minute,
+	TriesInMemory:          128,
+	TriesVerifyMode:        core.LocalVerify,
+	SnapshotCache:          102,
+	FilterLogCacheSize:     32,
+	Miner:                  minerconfig.DefaultConfig,
+	TxPool:                 legacypool.DefaultConfig,
+	BlobPool:               blobpool.DefaultConfig,
+	RPCGasCap:              50000000,
+	RPCEVMTimeout:          5 * time.Second,
+	GPO:                    FullNodeGPO,
+	TxSyncDefaultTimeout:   20 * time.Second,
+	TxSyncMaxTimeout:       1 * time.Minute,
+	RPCTxFeeCap:            1,                                         // 1 ether
+	BlobExtraReserve:       params.DefaultExtraReserveForBlobRequests, // Extra reserve threshold for blob, blob never expires when -1 is set, default 28800
+	EnableOpcodeOptimizing: false,
 }
 
-func init() {
-	home := os.Getenv("HOME")
-	if home == "" {
-		if user, err := user.Current(); err == nil {
-			home = user.HomeDir
-		}
-	}
-	if runtime.GOOS == "darwin" {
-		Defaults.Ethash.DatasetDir = filepath.Join(home, "Library", "Ethash")
-	} else if runtime.GOOS == "windows" {
-		localappdata := os.Getenv("LOCALAPPDATA")
-		if localappdata != "" {
-			Defaults.Ethash.DatasetDir = filepath.Join(localappdata, "Ethash")
-		} else {
-			Defaults.Ethash.DatasetDir = filepath.Join(home, "AppData", "Local", "Ethash")
-		}
-	} else {
-		Defaults.Ethash.DatasetDir = filepath.Join(home, ".ethash")
-	}
-}
+//go:generate go run github.com/fjl/gencodec -type Config -formats toml -out gen_config.go
 
-//go:generate gencodec -type Config -formats toml -out gen_config.go
-
-// Config contains configuration options for of the ETH and LES protocols.
+// Config contains configuration options for ETH and LES protocols.
 type Config struct {
 	// The genesis block, which is inserted if the database is empty.
 	// If nil, the Ethereum main net block is used.
 	Genesis *core.Genesis `toml:",omitempty"`
 
-	// Protocol options
-	NetworkId uint64 // Network ID to use for selecting peers to connect to
-	SyncMode  downloader.SyncMode
+	// Network ID separates blockchains on the peer-to-peer networking level. When left
+	// zero, the chain ID is used as network ID.
+	NetworkId uint64
+	SyncMode  SyncMode
 
 	// DisablePeerTxBroadcast is an optional config and disabled by default, and usually you do not need it.
 	// When this flag is enabled, you are requesting remote peers to stop broadcasting new transactions to you, and
@@ -138,51 +99,57 @@ type Config struct {
 	// transactions) or is continuously under high pressure (e.g., mempool is always full), then you can consider
 	// to turn it on.
 	DisablePeerTxBroadcast bool
+	EVNNodeIDsToAdd        []enode.ID
+	EVNNodeIDsToRemove     []enode.ID
+	// HistoryMode configures chain history retention.
+	HistoryMode history.HistoryMode
 
 	// This can be set to list of enrtree:// URLs which will be queried for
-	// for nodes to connect to.
-	EthDiscoveryURLs   []string
-	SnapDiscoveryURLs  []string
-	TrustDiscoveryURLs []string
-	BscDiscoveryURLs   []string
+	// nodes to connect to.
+	EthDiscoveryURLs  []string
+	SnapDiscoveryURLs []string
+	BscDiscoveryURLs  []string
 
-	NoPruning           bool // Whether to disable pruning and flush everything to disk
+	// State options.
+	NoPruning  bool // Whether to disable pruning and flush everything to disk
+	NoPrefetch bool // Whether to disable prefetching and only load state on demand
+
+	EnableBAL           bool
 	DirectBroadcast     bool
-	DisableSnapProtocol bool //Whether disable snap protocol
-	DisableDiffProtocol bool //Whether disable diff protocol
-	EnableTrustProtocol bool //Whether enable trust protocol
-	DisableBscProtocol  bool //Whether disable bsc protocol
-	DiffSync            bool // Whether support diff sync
-	PipeCommit          bool
+	DisableSnapProtocol bool // Whether disable snap protocol
 	RangeLimit          bool
 
+	// Deprecated: use 'TransactionHistory' instead.
 	TxLookupLimit uint64 `toml:",omitempty"` // The maximum number of blocks from head whose tx indices are reserved.
 
-	// Whitelist of required block number -> hash values to accept
-	Whitelist map[uint64]common.Hash `toml:"-"`
+	TransactionHistory uint64 `toml:",omitempty"` // The maximum number of blocks from head whose tx indices are reserved.
+	BlockHistory       uint64 `toml:",omitempty"` // The maximum number of blocks from head whose block body/header/receipt/diff/hash are reserved.
+	LogHistory         uint64 `toml:",omitempty"` // The maximum number of blocks from head where a log search index is maintained.
+	LogNoHistory       bool   `toml:",omitempty"` // No log search index is maintained.
+	// Deprecated: checkpoint file is auto-enabled at datadir/geth/filtermap_checkpoints.json.
+	LogExportCheckpoints string
+	StateHistory         uint64 `toml:",omitempty"` // The maximum number of blocks from head whose state histories are reserved.
 
-	// Light client options
-	LightServ          int  `toml:",omitempty"` // Maximum percentage of time allowed for serving LES requests
-	LightIngress       int  `toml:",omitempty"` // Incoming bandwidth limit for light servers
-	LightEgress        int  `toml:",omitempty"` // Outgoing bandwidth limit for light servers
-	LightPeers         int  `toml:",omitempty"` // Maximum number of LES client peers
-	LightNoPrune       bool `toml:",omitempty"` // Whether to disable light chain pruning
-	LightNoSyncServe   bool `toml:",omitempty"` // Whether to serve light clients before syncing
-	SyncFromCheckpoint bool `toml:",omitempty"` // Whether to sync the header chain from the configured checkpoint
+	// State scheme represents the scheme used to store ethereum states and trie
+	// nodes on top. It can be 'hash', 'path', or none which means use the scheme
+	// consistent with persistent state.
+	StateScheme   string `toml:",omitempty"` // State scheme used to store ethereum state and merkle trie nodes on top
+	PathSyncFlush bool   `toml:",omitempty"` // State scheme used to store ethereum state and merkle trie nodes on top
 
-	// Ultra Light client options
-	UltraLightServers      []string `toml:",omitempty"` // List of trusted ultra light servers
-	UltraLightFraction     int      `toml:",omitempty"` // Percentage of trusted servers to accept an announcement
-	UltraLightOnlyAnnounce bool     `toml:",omitempty"` // Whether to only announce headers, or also serve them
+	DisableTxIndexer bool `toml:",omitempty"` // Whether to enable the transaction indexer
+
+	// RequiredBlocks is a set of block number -> hash mappings which must be in the
+	// canonical chain of all remote peers. Setting the option makes geth verify the
+	// presence of these blocks for every new peer connection.
+	RequiredBlocks map[uint64]common.Hash `toml:"-"`
 
 	// Database options
 	SkipBcVersionCheck bool `toml:"-"`
 	DatabaseHandles    int  `toml:"-"`
 	DatabaseCache      int
 	DatabaseFreezer    string
-	DatabaseDiff       string
-	PersistDiff        bool
-	DiffBlock          uint64
+	DatabaseEra        string
+
 	// PruneAncientData is an optional config and disabled by default, and usually you do not need it.
 	// When this flag is enabled, only keep the latest 9w blocks' data, the older blocks' data will be
 	// pruned instead of being dumped to freezerdb, the pruned data includes CanonicalHash, Header, Block,
@@ -190,26 +157,29 @@ type Config struct {
 	// Notice: the PruneAncientData once be turned on, the get/chaindata/ancient dir will be removed,
 	// if restart without the pruneancient flag, the ancient data will start with the previous point that
 	// the oldest unpruned block number.
+	// !!Deprecated: use 'BlockHistory' instead.
 	PruneAncientData bool
+	TrieCleanCache   int
+	TrieDirtyCache   int
+	TrieTimeout      time.Duration
+	SnapshotCache    int
+	TriesInMemory    uint64
+	TriesVerifyMode  core.VerifyMode
+	Preimages        bool
 
-	TrieCleanCache          int
-	TrieCleanCacheJournal   string        `toml:",omitempty"` // Disk journal directory for trie cache to survive node restarts
-	TrieCleanCacheRejournal time.Duration `toml:",omitempty"` // Time interval to regenerate the journal for clean cache
-	TrieDirtyCache          int
-	TrieTimeout             time.Duration
-	SnapshotCache           int
-	TriesInMemory           uint64
-	TriesVerifyMode         core.VerifyMode
-	Preimages               bool
+	// This is the number of blocks for which logs will be cached in the filter system.
+	FilterLogCacheSize int
+
+	// This is the maximum number of addresses or topics allowed in filter criteria
+	// for eth_getLogs.
+	LogQueryLimit int
 
 	// Mining options
-	Miner miner.Config
-
-	// Ethash options
-	Ethash ethash.Config `toml:",omitempty"`
+	Miner minerconfig.Config
 
 	// Transaction pool options
-	TxPool core.TxPoolConfig
+	TxPool   legacypool.Config
+	BlobPool blobpool.Config
 
 	// Gas Price Oracle options
 	GPO gasprice.Config
@@ -217,8 +187,18 @@ type Config struct {
 	// Enables tracking of SHA3 preimages in the VM
 	EnablePreimageRecording bool
 
-	// Miscellaneous options
-	DocRoot string `toml:"-"`
+	// Enables collection of witness trie access statistics
+	EnableWitnessStats bool
+
+	// Generate execution witnesses and self-check against them (testing purpose)
+	StatelessSelfValidation bool
+
+	// Enables tracking of state size
+	EnableStateSizeTracking bool
+
+	// Enables VM tracing
+	VMTrace           string
+	VMTraceJsonConfig string
 
 	// RPCGasCap is the global gas cap for eth-call variants.
 	RPCGasCap uint64
@@ -226,57 +206,79 @@ type Config struct {
 	// RPCEVMTimeout is the global timeout for eth-call.
 	RPCEVMTimeout time.Duration
 
-	// RPCTxFeeCap is the global transaction fee(price * gaslimit) cap for
-	// send-transction variants. The unit is ether.
+	// RPCTxFeeCap is the global transaction fee (price * gas limit) cap for
+	// send-transaction variants. The unit is ether.
 	RPCTxFeeCap float64
 
-	// Checkpoint is a hardcoded checkpoint which can be nil.
-	Checkpoint *params.TrustedCheckpoint `toml:",omitempty"`
+	// OverridePassedForkTime
+	OverridePassedForkTime *uint64 `toml:",omitempty"`
 
-	// CheckpointOracle is the configuration for checkpoint oracle.
-	CheckpointOracle *params.CheckpointOracleConfig `toml:",omitempty"`
+	// OverrideLorentz (TODO: remove after the fork)
+	OverrideLorentz *uint64 `toml:",omitempty"`
 
-	// Berlin block override (TODO: remove after the fork)
-	OverrideBerlin *big.Int `toml:",omitempty"`
+	// OverrideMaxwell (TODO: remove after the fork)
+	OverrideMaxwell *uint64 `toml:",omitempty"`
 
-	// Arrow Glacier block override (TODO: remove after the fork)
-	OverrideArrowGlacier *big.Int `toml:",omitempty"`
+	// OverrideFermi (TODO: remove after the fork)
+	OverrideFermi *uint64 `toml:",omitempty"`
 
-	// OverrideTerminalTotalDifficulty (TODO: remove after the fork)
-	OverrideTerminalTotalDifficulty *big.Int `toml:",omitempty"`
+	// OverrideOsaka (TODO: remove after the fork)
+	OverrideOsaka *uint64 `toml:",omitempty"`
+
+	// OverrideMendel (TODO: remove after the fork)
+	OverrideMendel *uint64 `toml:",omitempty"`
+
+	// OverrideBPO1 (TODO: remove after the fork)
+	OverrideBPO1 *uint64 `toml:",omitempty"`
+
+	// OverrideBPO2 (TODO: remove after the fork)
+	OverrideBPO2 *uint64 `toml:",omitempty"`
+
+	// OverrideVerkle (TODO: remove after the fork)
+	OverrideVerkle *uint64 `toml:",omitempty"`
+
+	// EIP-7966: eth_sendRawTransactionSync timeouts
+	TxSyncDefaultTimeout time.Duration `toml:",omitempty"`
+	TxSyncMaxTimeout     time.Duration `toml:",omitempty"`
+
+	// blob setting
+	BlobExtraReserve uint64
+
+	//opcode optimization setting
+	EnableOpcodeOptimizing bool
+	// incremental snapshot config
+	EnableIncrSnapshots       bool
+	IncrSnapshotPath          string
+	IncrSnapshotBlockInterval uint64
+	IncrSnapshotStateBuffer   uint64
+	IncrSnapshotKeptBlocks    uint64
+	UseRemoteIncrSnapshot     bool
+	RemoteIncrSnapshotURL     string
 }
 
-// CreateConsensusEngine creates a consensus engine for the given chain configuration.
-func CreateConsensusEngine(stack *node.Node, chainConfig *params.ChainConfig, config *ethash.Config, notify []string, noverify bool, db ethdb.Database, ee *ethapi.PublicBlockChainAPI, genesisHash common.Hash) consensus.Engine {
-	if chainConfig.Parlia != nil {
-		return parlia.New(chainConfig, db, ee, genesisHash)
+// CreateConsensusEngine creates a consensus engine for the given chain config.
+// Clique is allowed for now to live standalone, but ethash is forbidden and can
+// only exist on already merged networks.
+func CreateConsensusEngine(config *params.ChainConfig, db ethdb.Database, ee *ethapi.BlockChainAPI, genesisHash common.Hash) (consensus.Engine, error) {
+	if config.IsInBSC() {
+		return parlia.New(config, db, ee, genesisHash), nil
+	}
+	if config.TerminalTotalDifficulty == nil {
+		log.Error("Geth only supports PoS networks. Please transition legacy networks using Geth v1.13.x.")
+		return nil, errors.New("'terminalTotalDifficulty' is not set in genesis block")
 	}
 	// If proof-of-authority is requested, set it up
-	var engine consensus.Engine
-	if chainConfig.Clique != nil {
-		engine = clique.New(chainConfig.Clique, db)
-	} else {
-		switch config.PowMode {
-		case ethash.ModeFake:
-			log.Warn("Ethash used in fake mode")
-		case ethash.ModeTest:
-			log.Warn("Ethash used in test mode")
-		case ethash.ModeShared:
-			log.Warn("Ethash used in shared mode")
-		}
-		engine = ethash.New(ethash.Config{
-			PowMode:          config.PowMode,
-			CacheDir:         stack.ResolvePath(config.CacheDir),
-			CachesInMem:      config.CachesInMem,
-			CachesOnDisk:     config.CachesOnDisk,
-			CachesLockMmap:   config.CachesLockMmap,
-			DatasetDir:       config.DatasetDir,
-			DatasetsInMem:    config.DatasetsInMem,
-			DatasetsOnDisk:   config.DatasetsOnDisk,
-			DatasetsLockMmap: config.DatasetsLockMmap,
-			NotifyFull:       config.NotifyFull,
-		}, notify, noverify)
-		engine.(*ethash.Ethash).SetThreads(-1) // Disable CPU mining
+	if config.Clique != nil {
+		return clique.New(config.Clique, db), nil
 	}
-	return beacon.New(engine)
+	return beacon.New(ethash.NewFaker()), nil
+}
+
+func ApplyDefaultEthConfig(cfg *Config) {
+	if cfg == nil {
+		log.Warn("ApplyDefaultEthConfig cfg == nil")
+		return
+	}
+
+	minerconfig.ApplyDefaultMinerConfig(&cfg.Miner)
 }

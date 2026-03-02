@@ -7,7 +7,6 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core"
-	"github.com/ethereum/go-ethereum/core/forkid"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/eth/protocols/bsc"
 	"github.com/ethereum/go-ethereum/eth/protocols/eth"
@@ -36,7 +35,7 @@ func (h *testBscHandler) Handle(peer *bsc.Peer, packet bsc.Packet) error {
 	}
 }
 
-func TestSendVotes67(t *testing.T) { testSendVotes(t, eth.ETH67) }
+func TestSendVotes68(t *testing.T) { testSendVotes(t, eth.ETH68) }
 
 func testSendVotes(t *testing.T, protocol uint) {
 	t.Parallel()
@@ -65,11 +64,7 @@ func testSendVotes(t *testing.T, protocol uint) {
 	protos := []p2p.Protocol{
 		{
 			Name:    "eth",
-			Version: eth.ETH66,
-		},
-		{
-			Name:    "eth",
-			Version: eth.ETH67,
+			Version: eth.ETH68,
 		},
 		{
 			Name:    "bsc",
@@ -79,11 +74,7 @@ func testSendVotes(t *testing.T, protocol uint) {
 	caps := []p2p.Cap{
 		{
 			Name:    "eth",
-			Version: eth.ETH66,
-		},
-		{
-			Name:    "eth",
-			Version: eth.ETH67,
+			Version: eth.ETH68,
 		},
 		{
 			Name:    "bsc",
@@ -117,9 +108,7 @@ func testSendVotes(t *testing.T, protocol uint) {
 	}(localBsc)
 
 	time.Sleep(200 * time.Millisecond)
-	remoteBsc.Handshake()
 
-	time.Sleep(200 * time.Millisecond)
 	go func(p *eth.Peer) {
 		handler.handler.runEthPeer(p, func(peer *eth.Peer) error {
 			return eth.Handle((*ethHandler)(handler.handler), peer)
@@ -128,12 +117,11 @@ func testSendVotes(t *testing.T, protocol uint) {
 
 	// Run the handshake locally to avoid spinning up a source handler
 	var (
-		genesis = handler.chain.Genesis()
-		head    = handler.chain.CurrentBlock()
-		td      = handler.chain.GetTd(head.Hash(), head.NumberU64())
+		head = handler.chain.CurrentBlock()
+		td   = handler.chain.GetTd(head.Hash(), head.Number.Uint64())
 	)
 	time.Sleep(200 * time.Millisecond)
-	if err := remoteEth.Handshake(1, td, head.Hash(), genesis.Hash(), forkid.NewIDWithChain(handler.chain), forkid.NewFilter(handler.chain), nil); err != nil {
+	if err := remoteEth.Handshake(1, handler.chain, eth.BlockRangeUpdatePacket{}, td, nil); err != nil {
 		t.Fatalf("failed to run protocol handshake: %d", err)
 	}
 	// After the handshake completes, the source handler should stream the sink
@@ -161,10 +149,9 @@ func testSendVotes(t *testing.T, protocol uint) {
 			t.Errorf("missing vote: %x", vote.Hash())
 		}
 	}
-
 }
 
-func TestRecvVotes67(t *testing.T) { testRecvVotes(t, eth.ETH67) }
+func TestRecvVotes68(t *testing.T) { testRecvVotes(t, eth.ETH68) }
 
 func testRecvVotes(t *testing.T, protocol uint) {
 	t.Parallel()
@@ -176,11 +163,7 @@ func testRecvVotes(t *testing.T, protocol uint) {
 	protos := []p2p.Protocol{
 		{
 			Name:    "eth",
-			Version: eth.ETH66,
-		},
-		{
-			Name:    "eth",
-			Version: eth.ETH67,
+			Version: eth.ETH68,
 		},
 		{
 			Name:    "bsc",
@@ -190,11 +173,7 @@ func testRecvVotes(t *testing.T, protocol uint) {
 	caps := []p2p.Cap{
 		{
 			Name:    "eth",
-			Version: eth.ETH66,
-		},
-		{
-			Name:    "eth",
-			Version: eth.ETH67,
+			Version: eth.ETH68,
 		},
 		{
 			Name:    "bsc",
@@ -228,9 +207,7 @@ func testRecvVotes(t *testing.T, protocol uint) {
 	}(localBsc)
 
 	time.Sleep(200 * time.Millisecond)
-	remoteBsc.Handshake()
 
-	time.Sleep(200 * time.Millisecond)
 	go func(p *eth.Peer) {
 		handler.handler.runEthPeer(p, func(peer *eth.Peer) error {
 			return eth.Handle((*ethHandler)(handler.handler), peer)
@@ -239,12 +216,11 @@ func testRecvVotes(t *testing.T, protocol uint) {
 
 	// Run the handshake locally to avoid spinning up a source handler
 	var (
-		genesis = handler.chain.Genesis()
-		head    = handler.chain.CurrentBlock()
-		td      = handler.chain.GetTd(head.Hash(), head.NumberU64())
+		head = handler.chain.CurrentBlock()
+		td   = handler.chain.GetTd(head.Hash(), head.Number.Uint64())
 	)
 	time.Sleep(200 * time.Millisecond)
-	if err := remoteEth.Handshake(1, td, head.Hash(), genesis.Hash(), forkid.NewIDWithChain(handler.chain), forkid.NewFilter(handler.chain), nil); err != nil {
+	if err := remoteEth.Handshake(1, handler.chain, eth.BlockRangeUpdatePacket{}, td, nil); err != nil {
 		t.Fatalf("failed to run protocol handshake: %d", err)
 	}
 
